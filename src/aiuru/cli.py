@@ -5,6 +5,8 @@ import urllib.request
 import json
 import subprocess
 
+from . import __version__
+
 from .ui import (
     COLOR_RED, COLOR_GREEN, COLOR_YELLOW, COLOR_CYAN, COLOR_BOLD, COLOR_RESET, COLOR_DIM, COLOR_PURPLE, COLOR_BLUE, COLOR_WHITE,
     print_banner, draw_table
@@ -53,7 +55,7 @@ def main():
     if not args:
         sys.argv.append("chat")
     else:
-        subcommands = {"setup", "quota", "models", "edit", "ask", "chat", "update"}
+        subcommands = {"setup", "quota", "models", "edit", "ask", "chat", "update", "version"}
         first_arg = args[0]
         
         if first_arg in ("-q", "--quota"):
@@ -77,6 +79,12 @@ def main():
         description=f"{COLOR_CYAN}{COLOR_BOLD}URU AI Space CLI - Professional Developer Assistant{COLOR_RESET}",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"aiuru v{__version__}",
+        help="Show program's version number and exit"
+    )
     
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
     
@@ -99,6 +107,7 @@ def main():
     chat_parser.add_argument("--session", help="Load / resume a saved chat session")
 
     subparsers.add_parser("update", help="Update the CLI tool to the latest version from GitHub")
+    subparsers.add_parser("version", help="Show version number and exit")
 
     if len(args) == 1 and args[0] in ("-h", "--help"):
         parser.print_help()
@@ -111,6 +120,9 @@ def main():
         return
     elif parsed_args.command == "update":
         run_self_update()
+        return
+    elif parsed_args.command == "version":
+        print(f"aiuru v{__version__}")
         return
 
     if not config.get("api_key"):
@@ -188,6 +200,7 @@ def main():
         model_id = config.get("default_model", 1)
         
         chat_history = []
+        session_name = parsed_args.session or "autosave"
         
         if parsed_args.session:
             loaded = load_session(parsed_args.session)
@@ -228,6 +241,7 @@ def main():
                         continue
                     elif cmd in ("/clear", "/c"):
                         chat_history = []
+                        save_session(session_name, chat_history, quiet=True)
                         print(f"{COLOR_YELLOW}Chat history cleared.{COLOR_RESET}")
                         continue
                     elif cmd == "/save":
@@ -235,6 +249,7 @@ def main():
                             print(f"{COLOR_RED}Please specify a session name. E.g. /save my_session{COLOR_RESET}")
                         else:
                             save_session(parts[1], chat_history)
+                            session_name = parts[1]
                         continue
                     elif cmd == "/load":
                         if len(parts) < 2:
@@ -243,6 +258,7 @@ def main():
                             loaded = load_session(parts[1])
                             if loaded is not None:
                                 chat_history = loaded
+                                session_name = parts[1]
                                 print(f"{COLOR_GREEN}Loaded session '{parts[1]}' with {len(chat_history)} messages.{COLOR_RESET}")
                         continue
                     elif cmd in ("/edit", "/e"):
@@ -286,6 +302,7 @@ def main():
                 ai_response = make_completion(config, messages)
                 if ai_response:
                     chat_history.append({"role": "assistant", "content": ai_response})
+                    save_session(session_name, chat_history, quiet=True)
                 else:
                     chat_history.pop()
                     

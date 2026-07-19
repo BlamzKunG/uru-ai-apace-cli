@@ -36,14 +36,16 @@ def get_session_path(name):
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     return os.path.join(SESSIONS_DIR, f"{name}.json")
 
-def save_session(name, chat_history):
+def save_session(name, chat_history, quiet=False):
     path = get_session_path(name)
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(chat_history, f, indent=2, ensure_ascii=False)
-        print(f"{COLOR_GREEN}Session '{name}' saved successfully.{COLOR_RESET}")
+        if not quiet:
+            print(f"{COLOR_GREEN}Session '{name}' saved successfully.{COLOR_RESET}")
     except Exception as e:
-        print(f"{COLOR_RED}Failed to save session: {e}{COLOR_RESET}")
+        if not quiet:
+            print(f"{COLOR_RED}Failed to save session: {e}{COLOR_RESET}")
 
 def load_session(name):
     path = get_session_path(name)
