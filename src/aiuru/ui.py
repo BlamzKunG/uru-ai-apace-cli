@@ -16,9 +16,10 @@ COLOR_WHITE = "\033[37m"
 
 def print_banner():
     banner = f"""{COLOR_CYAN}{COLOR_BOLD}
- _  _ ___  _  _    ____ ___    ____ ___  ____ ____ ____ 
- |  | |__] |  |    |__|  |     [__  |__] |__| |    |___ 
- |__| |  \\ |__|    |  |  |     ___] |    |  | |___ |___ {COLOR_RESET}{COLOR_DIM}v2.0 (Real CLI Edition){COLOR_RESET}
+ _  _  ___  _  _      _    _      ____  ___   _    ____  ____ 
+| | | | _ \\| | | |    / \\  | |    / ___||  _ \\ / \\  / ___|| ___|
+| |_| ||   /| |_| |   / _ \\ | |    \\___ \\|  __/ / _ \\| |    |  _| 
+ \\___/ |_|_\\ \\___/   /_/ \\_\\|_|    |____/|_|   /_/ \\_\\____||____| {COLOR_RESET}{COLOR_DIM}v2.0 (Real CLI Edition){COLOR_RESET}
 {COLOR_DIM}URU AI Space CLI - Professional developer tool. Type TAB for autocomplete.{COLOR_RESET}
 """
     print(banner)
