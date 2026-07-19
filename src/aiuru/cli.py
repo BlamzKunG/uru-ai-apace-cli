@@ -71,9 +71,15 @@ def main():
         elif first_arg == "--session":
             sys.argv = [sys.argv[0], "chat"] + args
         elif first_arg in ("-f", "--file", "--system"):
-            sys.argv = [sys.argv[0], "ask"] + args
+            if sys.stdout.isatty():
+                sys.argv = [sys.argv[0], "chat"] + args
+            else:
+                sys.argv = [sys.argv[0], "ask"] + args
         elif first_arg not in subcommands and not first_arg.startswith("-"):
-            sys.argv = [sys.argv[0], "ask"] + args
+            if sys.stdout.isatty():
+                sys.argv = [sys.argv[0], "chat"] + args
+            else:
+                sys.argv = [sys.argv[0], "ask"] + args
 
     parser = argparse.ArgumentParser(
         description=f"{COLOR_CYAN}{COLOR_BOLD}URU AI Space CLI - Professional Developer Assistant{COLOR_RESET}",
@@ -105,6 +111,9 @@ def main():
     
     chat_parser = subparsers.add_parser("chat", help="Start interactive chatbot session")
     chat_parser.add_argument("--session", help="Load / resume a saved chat session")
+    chat_parser.add_argument("initial_prompt", nargs="*", help="Initial prompt to send on startup")
+    chat_parser.add_argument("-f", "--file", help="Attach a local file to the initial prompt context")
+    chat_parser.add_argument("--system", help="Override system prompt for this session")
 
     subparsers.add_parser("update", help="Update the CLI tool to the latest version from GitHub")
     subparsers.add_parser("version", help="Show version number and exit")
@@ -208,12 +217,60 @@ def main():
                 chat_history = loaded
                 print(f"{COLOR_GREEN}Loaded session '{parsed_args.session}' with {len(chat_history)} messages.{COLOR_RESET}")
                 
+        piped_input = ""
+        if not sys.stdin.isatty():
+            try:
+                piped_input = sys.stdin.read().strip()
+                try:
+                    sys.stdin = open("/dev/tty")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+                
+        initial_parts = []
+        if parsed_args.file:
+            if os.path.exists(parsed_args.file):
+                try:
+                    with open(parsed_args.file, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    filename = os.path.basename(parsed_args.file)
+                    initial_parts.append(f"--- FILE: {filename} ---\n{content}\n--- END OF FILE ---")
+                except Exception as e:
+                    print(f"{COLOR_RED}Failed to read file {parsed_args.file}: {e}{COLOR_RESET}")
+                    return
+            else:
+                print(f"{COLOR_RED}File not found: {parsed_args.file}{COLOR_RESET}")
+                return
+                
+        if piped_input:
+            initial_parts.append(piped_input)
+            
+        if parsed_args.initial_prompt:
+            initial_parts.append(" ".join(parsed_args.initial_prompt))
+            
         print(f"{COLOR_BOLD}Current Model:{COLOR_RESET} {COLOR_GREEN}{model_name}{COLOR_RESET} {COLOR_DIM}[ID: {model_id}]{COLOR_RESET}")
-        sys_prompt_active = config.get("system_prompt")
+        sys_prompt_active = parsed_args.system or config.get("system_prompt")
         if sys_prompt_active:
             print(f"{COLOR_BOLD}System Prompt:{COLOR_RESET} {COLOR_PURPLE}{sys_prompt_active}{COLOR_RESET}")
         print(f"Type {COLOR_CYAN}/help{COLOR_RESET} to show commands, {COLOR_CYAN}Tab{COLOR_RESET} to autocomplete commands.")
         print("-" * 50)
+        
+        if initial_parts:
+            final_initial_prompt = "\n\n".join(initial_parts)
+            chat_history.append({"role": "user", "content": final_initial_prompt})
+            
+            messages = []
+            if sys_prompt_active:
+                messages.append({"role": "system", "content": sys_prompt_active})
+            messages.extend(chat_history)
+            
+            ai_response = make_completion(config, messages)
+            if ai_response:
+                chat_history.append({"role": "assistant", "content": ai_response})
+                save_session(session_name, chat_history, quiet=True)
+            else:
+                chat_history.pop()
         
         while True:
             try:
