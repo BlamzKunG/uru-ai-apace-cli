@@ -12,7 +12,8 @@ from .ui import (
     print_banner, draw_table
 )
 from .config import (
-    load_config, save_config, get_session_path, save_session, load_session, list_sessions, print_quota_info,
+    load_config, save_config, get_session_path, save_session, load_session, list_sessions,
+    delete_session, get_latest_session, generate_ssid, print_quota_info,
     GITHUB_USER, GITHUB_REPO
 )
 from .api import (
@@ -42,11 +43,31 @@ def print_help_guide():
     print("  /model, /m              Change the active model")
     print("  /quota, /q              View current daily token quota usage")
     print("  /system, /s             Set system prompt (e.g. `/system be brief`) or `/system clear`")
-    print("  /save                   Save current chat history (e.g. `/save debug_session`)")
-    print("  /load                   Load a saved chat history (e.g. `/load debug_session`)")
+    print("  /save <name>            Save current chat history to a named session")
+    print("  /load <name>            Load a saved chat history by session name")
+    print("  /delete, /d <name>      Delete a saved chat session by name/SSID")
     print("  /edit, /e <file> <ins>  Edit/Write file (e.g. `/edit test.py make it print hi`)")
     print("  /clear, /c              Clear current chat history")
     print("  /exit, /x               Exit chatbot")
+
+# Setup Readline Autocomplete if available
+try:
+    import readline
+    commands_list = ['/help', '/h', '/model', '/m', '/quota', '/q', '/clear', '/c', '/exit', '/x', '/save', '/load', '/delete', '/d', '/system', '/s', '/edit', '/e']
+    
+    def completer(text, state):
+        options = [cmd for cmd in commands_list if cmd.startswith(text)]
+        if state < len(options):
+            return options[state]
+        else:
+            return None
+            
+    readline.set_completer(completer)
+    readline.parse_and_bind("tab: complete")
+    readline.parse_and_bind("set completion-ignore-case on")
+    readline.parse_and_bind("set show-all-if-ambiguous on")
+except ImportError:
+    pass
 
 def main():
     config = load_config()
@@ -55,7 +76,7 @@ def main():
     if not args:
         sys.argv.append("chat")
     else:
-        subcommands = {"setup", "quota", "models", "edit", "ask", "chat", "update", "version"}
+        subcommands = {"setup", "quota", "models", "edit", "ask", "chat", "update", "version", "session", "resume"}
         first_arg = args[0]
         
         if first_arg in ("-q", "--quota"):
@@ -68,8 +89,32 @@ def main():
             sys.argv = [sys.argv[0], "setup"]
         elif first_arg in ("-e", "--edit") and len(args) > 1:
             sys.argv = [sys.argv[0], "edit"] + args[1:]
-        elif first_arg == "--session":
-            sys.argv = [sys.argv[0], "chat"] + args
+        elif first_arg in ("resume", "-r", "--resume"):
+            target_ssid = ""
+            if len(args) > 1 and not args[1].startswith("-"):
+                target_ssid = args[1]
+            else:
+                target_ssid = get_latest_session() or ""
+            
+            if target_ssid:
+                sys.argv = [sys.argv[0], "chat", "--session", target_ssid]
+            else:
+                sys.argv = [sys.argv[0], "chat"]
+        elif first_arg in ("session", "--session"):
+            if any(a in ("--list", "list", "-l") for a in args):
+                sys.argv = [sys.argv[0], "session", "--list"]
+            elif any(a in ("--delete", "delete", "-d") for a in args):
+                del_idx = -1
+                for idx, a in enumerate(args):
+                    if a in ("--delete", "delete", "-d"):
+                        del_idx = idx
+                        break
+                target_ssid = args[del_idx + 1] if del_idx != -1 and del_idx + 1 < len(args) else ""
+                sys.argv = [sys.argv[0], "session", "--delete", target_ssid]
+            elif len(args) > 1 and not args[1].startswith("-"):
+                sys.argv = [sys.argv[0], "chat", "--session", args[1]]
+            else:
+                sys.argv = [sys.argv[0], "session", "--list"]
         elif first_arg in ("-f", "--file", "--system"):
             if sys.stdout.isatty():
                 sys.argv = [sys.argv[0], "chat"] + args
@@ -115,6 +160,13 @@ def main():
     chat_parser.add_argument("-f", "--file", help="Attach a local file to the initial prompt context")
     chat_parser.add_argument("--system", help="Override system prompt for this session")
 
+    session_parser = subparsers.add_parser("session", help="Manage saved chat sessions")
+    session_parser.add_argument("--list", "-l", action="store_true", help="List all saved chat sessions")
+    session_parser.add_argument("--delete", "-d", metavar="SSID", help="Delete a saved chat session by SSID")
+
+    resume_parser = subparsers.add_parser("resume", help="Resume a saved chat session by SSID (or latest session if omitted)")
+    resume_parser.add_argument("ssid", nargs="?", help="Session ID (SSID) to resume")
+
     subparsers.add_parser("update", help="Update the CLI tool to the latest version from GitHub")
     subparsers.add_parser("version", help="Show version number and exit")
 
@@ -133,6 +185,21 @@ def main():
     elif parsed_args.command == "version":
         print(f"aiuru v{__version__}")
         return
+    elif parsed_args.command == "session":
+        if parsed_args.delete:
+            delete_session(parsed_args.delete)
+        else:
+            list_sessions()
+        return
+    elif parsed_args.command == "resume":
+        target = parsed_args.ssid or get_latest_session()
+        if target:
+            sys.argv = [sys.argv[0], "chat", "--session", target]
+            parsed_args = parser.parse_args(sys.argv[1:])
+        else:
+            print(f"{COLOR_YELLOW}No saved sessions found to resume. Starting a new session.{COLOR_RESET}")
+            sys.argv = [sys.argv[0], "chat"]
+            parsed_args = parser.parse_args(sys.argv[1:])
 
     if not config.get("api_key"):
         print_banner()
@@ -209,14 +276,15 @@ def main():
         model_id = config.get("default_model", 1)
         
         chat_history = []
-        session_name = parsed_args.session or "autosave"
-        
         if parsed_args.session:
+            session_name = parsed_args.session
             loaded = load_session(parsed_args.session)
             if loaded is not None:
                 chat_history = loaded
                 print(f"{COLOR_GREEN}Loaded session '{parsed_args.session}' with {len(chat_history)} messages.{COLOR_RESET}")
-                
+        else:
+            session_name = generate_ssid()
+            
         piped_input = ""
         if not sys.stdin.isatty():
             try:
@@ -250,6 +318,7 @@ def main():
             initial_parts.append(" ".join(parsed_args.initial_prompt))
             
         print(f"{COLOR_BOLD}Current Model:{COLOR_RESET} {COLOR_GREEN}{model_name}{COLOR_RESET} {COLOR_DIM}[ID: {model_id}]{COLOR_RESET}")
+        print(f"{COLOR_BOLD}Session ID (SSID):{COLOR_RESET} {COLOR_CYAN}{session_name}{COLOR_RESET}")
         sys_prompt_active = parsed_args.system or config.get("system_prompt")
         if sys_prompt_active:
             print(f"{COLOR_BOLD}System Prompt:{COLOR_RESET} {COLOR_PURPLE}{sys_prompt_active}{COLOR_RESET}")
@@ -272,6 +341,13 @@ def main():
             else:
                 chat_history.pop()
         
+        def exit_chat_session():
+            if chat_history:
+                save_session(session_name, chat_history, quiet=True)
+                print(f"\n{COLOR_DIM}[Session Log] session = {session_name}{COLOR_RESET}")
+                print(f"{COLOR_DIM}To resume this session, run: {COLOR_CYAN}aiuru resume {session_name}{COLOR_RESET}\n")
+            print(f"{COLOR_YELLOW}Goodbye!{COLOR_RESET}")
+
         while True:
             try:
                 user_input = input(f"\n{COLOR_GREEN}{COLOR_BOLD}You: {COLOR_RESET}").strip()
@@ -283,7 +359,7 @@ def main():
                     cmd = parts[0].lower()
                     
                     if cmd in ("/exit", "/quit", "/x"):
-                        print(f"{COLOR_YELLOW}Goodbye!{COLOR_RESET}")
+                        exit_chat_session()
                         break
                     elif cmd in ("/help", "/h"):
                         print_help_guide()
@@ -305,8 +381,8 @@ def main():
                         if len(parts) < 2:
                             print(f"{COLOR_RED}Please specify a session name. E.g. /save my_session{COLOR_RESET}")
                         else:
-                            save_session(parts[1], chat_history)
                             session_name = parts[1]
+                            save_session(session_name, chat_history)
                         continue
                     elif cmd == "/load":
                         if len(parts) < 2:
@@ -317,6 +393,12 @@ def main():
                                 chat_history = loaded
                                 session_name = parts[1]
                                 print(f"{COLOR_GREEN}Loaded session '{parts[1]}' with {len(chat_history)} messages.{COLOR_RESET}")
+                        continue
+                    elif cmd in ("/delete", "/d"):
+                        if len(parts) < 2:
+                            print(f"{COLOR_RED}Usage: /delete <session_id>{COLOR_RESET}")
+                        else:
+                            delete_session(parts[1])
                         continue
                     elif cmd in ("/edit", "/e"):
                         if len(parts) < 3:
@@ -351,7 +433,7 @@ def main():
                 chat_history.append({"role": "user", "content": user_input})
                 
                 messages = []
-                sys_prompt_active = config.get("system_prompt")
+                sys_prompt_active = parsed_args.system or config.get("system_prompt")
                 if sys_prompt_active:
                     messages.append({"role": "system", "content": sys_prompt_active})
                 messages.extend(chat_history)
@@ -363,11 +445,8 @@ def main():
                 else:
                     chat_history.pop()
                     
-            except KeyboardInterrupt:
-                print(f"\n{COLOR_YELLOW}Goodbye!{COLOR_RESET}")
-                break
-            except EOFError:
-                print(f"\n{COLOR_YELLOW}Goodbye!{COLOR_RESET}")
+            except (KeyboardInterrupt, EOFError):
+                exit_chat_session()
                 break
 
 if __name__ == "__main__":

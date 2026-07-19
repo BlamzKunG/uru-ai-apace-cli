@@ -1,5 +1,6 @@
 import os
 import json
+import datetime
 from .ui import (
     COLOR_RED, COLOR_GREEN, COLOR_YELLOW, COLOR_CYAN, COLOR_WHITE, COLOR_DIM, COLOR_BOLD, COLOR_RESET,
     draw_table
@@ -32,6 +33,10 @@ def save_config(config):
     except Exception as e:
         print(f"{COLOR_RED}Error saving config: {e}{COLOR_RESET}")
 
+def generate_ssid():
+    now = datetime.datetime.now()
+    return now.strftime("sess_%Y%m%d_%H%M%S")
+
 def get_session_path(name):
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     return os.path.join(SESSIONS_DIR, f"{name}.json")
@@ -59,6 +64,32 @@ def load_session(name):
         print(f"{COLOR_RED}Failed to load session: {e}{COLOR_RESET}")
         return None
 
+def delete_session(name):
+    if not name:
+        print(f"{COLOR_RED}Please specify a session ID to delete. E.g. aiuru session --delete sess_20260719_165242{COLOR_RESET}")
+        return False
+    path = get_session_path(name)
+    if not os.path.exists(path):
+        print(f"{COLOR_RED}Session '{name}' not found.{COLOR_RESET}")
+        return False
+    try:
+        os.remove(path)
+        print(f"{COLOR_GREEN}Session '{name}' deleted successfully.{COLOR_RESET}")
+        return True
+    except Exception as e:
+        print(f"{COLOR_RED}Failed to delete session '{name}': {e}{COLOR_RESET}")
+        return False
+
+def get_latest_session():
+    if not os.path.exists(SESSIONS_DIR):
+        return None
+    files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith(".json")]
+    if not files:
+        return None
+    files_with_time = [(f, os.path.getmtime(os.path.join(SESSIONS_DIR, f))) for f in files]
+    files_with_time.sort(key=lambda x: x[1], reverse=True)
+    return files_with_time[0][0][:-5]
+
 def list_sessions():
     if not os.path.exists(SESSIONS_DIR):
         print(f"{COLOR_YELLOW}No saved sessions found.{COLOR_RESET}")
@@ -67,10 +98,31 @@ def list_sessions():
     if not files:
         print(f"{COLOR_YELLOW}No saved sessions found.{COLOR_RESET}")
         return
-    print(f"{COLOR_BOLD}{COLOR_CYAN}Saved Sessions:{COLOR_RESET}")
-    for idx, f in enumerate(files, 1):
-        name = f[:-5]
-        print(f"{COLOR_GREEN}{idx}. {COLOR_WHITE}{name}{COLOR_RESET}")
+
+    files_with_time = []
+    for f in files:
+        path = os.path.join(SESSIONS_DIR, f)
+        mtime = os.path.getmtime(path)
+        files_with_time.append((f, mtime, path))
+
+    files_with_time.sort(key=lambda x: x[1], reverse=True)
+
+    headers = ["#", "Session ID (SSID)", "Messages", "Last Updated"]
+    rows = []
+    for idx, (f, mtime, path) in enumerate(files_with_time, 1):
+        ssid = f[:-5]
+        mtime_str = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+        msg_count = 0
+        try:
+            with open(path, "r", encoding="utf-8") as sf:
+                history = json.load(sf)
+                if isinstance(history, list):
+                    msg_count = len(history)
+        except Exception:
+            pass
+        rows.append([idx, f"{COLOR_CYAN}{ssid}{COLOR_RESET}", f"{msg_count} msgs", f"{COLOR_DIM}{mtime_str}{COLOR_RESET}"])
+
+    draw_table("SAVED CHAT SESSIONS", headers, rows)
 
 def print_quota_info(config):
     quota = config.get("last_quota")
