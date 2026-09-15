@@ -1,0 +1,268 @@
+name: WebUI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master, 'dev/*' ]
+    paths:
+      - 'webui/**'
+      - 'pyproject.toml'
+      - 'Makefile'
+      - 'scripts/validate_release_package.py'
+      - '.github/workflows/webui.yml'
+      - '.github/workflows/webui-visual-diff.yml'
+      - '.github/scripts/diff-screenshots.sh'
+
+defaults:
+  run:
+    working-directory: webui
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20.x]
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Use Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v7
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+        cache-dependency-path: webui/package-lock.json
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Type check
+      run: npm run typecheck
+
+    - name: Lint
+      run: npm run lint
+
+    - name: Test
+      run: npm test
+
+    - name: Build
+      run: npm run build
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.12'
+
+    - name: Verify release package includes the built webui
+      working-directory: .
+      run: |
+        make bundle-webui
+        pipx install poetry
+        poetry build
+        make validate-release-package
+
+    - name: Upload dist artifact
+      if: github.ref == 'refs/heads/master'
+      uses: actions/upload-artifact@v7
+      with:
+        name: webui-dist
+        path: webui/dist
+        retention-days: 30
+
+  deploy:
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: chat-gptme-org
+      url: https://chat.gptme.org
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Download dist artifact
+      uses: actions/download-artifact@v6
+      with:
+        name: webui-dist
+        path: dist
+
+    - name: Deploy to Cloudflare Pages
+      uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0  # v4.0.0
+      with:
+        apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        command: pages deploy dist --project-name=gptme-webui
+
+    - name: Smoke test deployed deep links
+      working-directory: .
+      run: |
+        python3 scripts/verify_cloudflare_pages_deep_links.py \
+          --redirects-path dist/_redirects \
+          --base-url https://chat.gptme.org
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Use Node.js 20
+      uses: actions/setup-node@v7
+      with:
+        node-version: 20
+        cache: 'npm'
+        cache-dependency-path: webui/package-lock.json
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install frontend dependencies
+      run: npm ci
+
+    - name: Install Playwright browsers
+      run: npx playwright install --with-deps chromium
+
+    # ── stable pass (latest PyPI release) ────────────────────────────────────
+    - name: Install stable gptme (PyPI)
+      working-directory: .
+      run: pip install 'gptme[server]'
+
+    - name: Start server (stable)
+      env:
+        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || 'dummy-ci-key' }}
+        MODEL: anthropic/claude-3-5-haiku-latest
+      run: |
+        # Playwright serves the webui at http://127.0.0.1:5701 — the CORS origin
+        # must match that exact origin (localhost != 127.0.0.1 for CORS); with a
+        # mismatched origin the webui silently runs offline against demo data
+        # and no e2e test exercises the server at all.
+        gptme-server --cors-origin="http://127.0.0.1:5701,http://localhost:5701" &
+        echo $! > /tmp/gptme-server.pid
+        sleep 3
+
+    - name: Health-check server (stable)
+      run: curl --retry 2 --retry-delay 5 --retry-connrefused -sSfL http://localhost:5700/api/v2
+
+    - name: Run e2e tests (stable)
+      id: e2e-stable
+      continue-on-error: true
+      env:
+        # Latest PyPI release still has the workspace-containment create
+        # regression (#2943, fixed by #3319). Remove after the next release.
+        E2E_SKIP_CREATE_CONVERSATION: '1'
+      run: npm run test:e2e
+
+    - name: Upload stable test results
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: playwright-report-stable
+        path: webui/playwright-report/
+        retention-days: 30
+
+    - name: Stop server (stable)
+      if: always()
+      working-directory: .
+      run: |
+        kill "$(cat /tmp/gptme-server.pid)" 2>/dev/null || true
+        sleep 2
+
+    # ── dev pass (this checkout) ──────────────────────────────────────────────
+    # Install from the PR/branch checkout, NOT git master: the e2e run must
+    # exercise the server code under review, otherwise server-side regressions
+    # (like the #2943 create breakage) can never be caught pre-merge.
+    - name: Install dev gptme (this checkout)
+      working-directory: .
+      run: |
+        pip uninstall -y gptme
+        pip install '.[server]'
+
+    - name: Start server (dev)
+      env:
+        # mock/echo needs no API key — generation completes deterministically
+        # and exercises the full SSE streaming path without any real LLM call.
+        # This lets the generation.spec.ts E2E tests run in CI without secrets.
+        MODEL: mock/echo
+        GPTME_DISABLE_AUTH: "1"
+      run: |
+        gptme-server --cors-origin="http://127.0.0.1:5701,http://localhost:5701" &
+        echo $! > /tmp/gptme-server.pid
+        sleep 3
+
+    - name: Health-check server (dev)
+      run: curl --retry 2 --retry-delay 5 --retry-connrefused -sSfL http://localhost:5700/api/v2
+
+    - name: Run e2e tests (dev)
+      id: e2e-dev
+      continue-on-error: true
+      run: npm run test:e2e
+
+    - name: Upload dev test results
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: playwright-report-dev
+        path: webui/playwright-report/
+        retention-days: 30
+
+    - name: Stop server (dev)
+      if: always()
+      working-directory: .
+      run: kill "$(cat /tmp/gptme-server.pid)" 2>/dev/null || true
+
+    - name: Require both passes to succeed
+      if: always()
+      working-directory: .
+      run: |
+        stable="${{ steps.e2e-stable.outcome }}"
+        dev="${{ steps.e2e-dev.outcome }}"
+        echo "stable: $stable  dev: $dev"
+        # The dev pass exercises the PR code and is the primary gate.
+        # The stable pass tests the latest PyPI release, which may have known
+        # regressions (e.g., #2943) causing timeouts. The stable pass failure
+        # does not block PRs until the next gptme release ships the fix.
+        [ "$dev" = "success" ]
+
+  # ── Visual snapshot capture (PRs only) ───────────────────────────────────────
+  # Takes UI screenshots of the PR branch so that webui-visual-diff.yml can
+  # compare them against a master baseline and post a before/after comment
+  # when visual changes are detected.  No gptme server is needed — the webui
+  # runs in demo mode via `npm run dev`.
+  screenshots:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Use Node.js 20
+      uses: actions/setup-node@v7
+      with:
+        node-version: 20
+        cache: 'npm'
+        cache-dependency-path: webui/package-lock.json
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Install Playwright browsers
+      run: npx playwright install --with-deps chromium
+
+    - name: Take visual snapshots (PR branch — "after")
+      working-directory: webui
+      env:
+        SCREENSHOTS_DIR: ${{ github.workspace }}/visual-snapshots
+      run: npx playwright test e2e/visual-snapshots.spec.ts --reporter=dot
+
+    - name: Upload visual snapshots
+      uses: actions/upload-artifact@v7
+      with:
+        # Fixed name: the downstream workflow_run job scopes the download by
+        # run_id, so we don't need the PR number in the artifact name here.
+        name: webui-visual-snapshots
+        path: visual-snapshots/
+        retention-days: 7

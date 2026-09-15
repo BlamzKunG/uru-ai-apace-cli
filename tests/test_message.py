@@ -1,0 +1,934 @@
+import json
+from datetime import datetime, timezone
+from io import StringIO
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import pytest
+
+from gptme.message import Message, msgs_to_toml, toml_to_msgs
+
+if TYPE_CHECKING:
+    from gptme.util.uri import FilePath
+
+
+def test_toml():
+    # single message, check escaping
+    msg = Message(
+        "system",
+        '''Hello world!
+"""Difficult to handle string"""''',
+    )
+    t = msg.to_toml()
+    print(t)
+    m = Message.from_toml(t)
+    print(m)
+    assert msg.content == m.content
+    assert msg.role == m.role
+    assert msg.timestamp.date() == m.timestamp.date()
+    assert msg.timestamp.timetuple() == m.timestamp.timetuple()
+
+    # multiple messages
+    msg2 = Message("user", "Hello computer!", pinned=True, hide=True)
+    ts = msgs_to_toml([msg, msg2])
+    print(ts)
+    ms = toml_to_msgs(ts)
+    print(ms)
+    assert len(ms) == 2
+    assert ms[0].role == msg.role
+    assert ms[0].timestamp.timetuple() == msg.timestamp.timetuple()
+    assert ms[0].content == msg.content
+    assert ms[1].content == msg2.content
+
+    # check flags
+    assert ms[1].pinned == msg2.pinned
+    assert ms[1].hide == msg2.hide
+
+
+def test_get_codeblocks():
+    # single codeblock only
+    msg = Message(
+        "system",
+        """```ipython
+def test():
+    print("Hello world!")
+```""",
+    )
+    codeblocks = msg.get_codeblocks()
+    assert len(codeblocks) == 1
+
+    # multiple codeblocks and leading/trailing text
+    msg = Message(
+        "system",
+        """Hello world!
+
+```bash
+echo "Hello world!"
+```
+
+```ipython
+print("Hello world!")
+```
+
+That's all folks!
+""",
+    )
+    codeblocks = msg.get_codeblocks()
+    assert len(codeblocks) == 2
+
+
+def test_format_msgs_escapes_rich_markup():
+    """Test that Rich markup is properly escaped in format_msgs."""
+    from gptme.message import Message, format_msgs
+
+    # Test with content containing Rich-like markup that should be escaped
+    msg = Message("user", "Testing [project] with [bold]content[/bold]")
+
+    # Without highlight, preserve the literal content for plaintext consumers
+    outputs_no_highlight = format_msgs([msg], highlight=False)
+    assert outputs_no_highlight[0].endswith(
+        "Testing [project] with [bold]content[/bold]"
+    )
+
+    # With highlight, escape message content while preserving generated role markup.
+    outputs_highlight = format_msgs([msg], highlight=True)
+    assert outputs_highlight[0].endswith(
+        r"Testing \[project] with \[bold]content\[/bold]"
+    )
+
+
+def test_format_msgs_no_highlight_preserves_path_like_bracket():
+    """Plaintext formatting must preserve path-like bracket content verbatim."""
+    from gptme.message import Message, format_msgs
+
+    # Content that matches a Rich closing-tag pattern (slash prefix)
+    msg = Message(
+        "user", "Run the script at [/home/runner/run.sh] to reproduce the issue."
+    )
+
+    outputs = format_msgs([msg], highlight=False)
+    assert outputs[0].endswith(
+        "Run the script at [/home/runner/run.sh] to reproduce the issue."
+    )
+
+
+def test_format_msgs_oneline_escapes_rich_markup():
+    """Test that Rich markup is escaped in oneline mode."""
+    from gptme.message import Message, format_msgs
+
+    msg = Message("user", "Testing [project]\nwith newlines")
+
+    # Without highlight, preserve literal brackets for plaintext consumers
+    outputs_no_highlight = format_msgs([msg], oneline=True, highlight=False)
+    assert outputs_no_highlight[0].endswith("Testing [project]\\nwith newlines")
+
+    # With highlight and oneline
+    outputs_highlight = format_msgs([msg], oneline=True, highlight=True)
+    assert len(outputs_highlight) == 1
+    # Verify no Rich markup interpretation error
+
+
+def test_format_msgs_oneline_no_highlight_preserves_path_like_bracket():
+    """Oneline plaintext formatting must preserve path-like brackets verbatim."""
+    from gptme.message import Message, format_msgs
+
+    msg = Message(
+        "user", "Run the script at [/home/runner/run.sh] to reproduce the issue."
+    )
+
+    outputs = format_msgs([msg], oneline=True, highlight=False)
+    assert outputs[0].endswith(
+        "Run the script at [/home/runner/run.sh] to reproduce the issue."
+    )
+
+
+def test_print_msg_no_highlight_preserves_rich_syntax(monkeypatch):
+    """Non-TTY output must disable Rich parsing at the console boundary."""
+    from unittest.mock import patch
+
+    from gptme.message import Message, print_msg
+
+    msg = Message("user", "Run [/home/runner/run.sh] :warning:")
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+
+    with patch("gptme.message.console") as mock_console:
+        assert print_msg(msg) == 1
+
+    (rendered,) = mock_console.print.call_args.args
+    assert rendered.endswith("Run [/home/runner/run.sh] :warning:")
+    assert mock_console.print.call_args.kwargs == {"markup": False, "emoji": False}
+
+
+def test_print_msg_highlight_path_like_bracket_is_escaped(monkeypatch):
+    """TTY output must escape message content before enabling Rich markup."""
+    from unittest.mock import patch
+
+    from gptme.message import Message, print_msg
+
+    msg = Message("user", "Run [/home/runner/run.sh]")
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    with patch("gptme.message.console") as mock_console:
+        assert print_msg(msg, highlight=True) == 1
+
+    (rendered,) = mock_console.print.call_args.args
+    assert rendered.endswith(r"Run \[/home/runner/run.sh]")
+    assert mock_console.print.call_args.kwargs == {"markup": True, "emoji": False}
+
+
+def test_format_msgs_preserves_codeblocks():
+    """Test that code blocks are not escaped (for syntax highlighting)."""
+    from gptme.message import Message, format_msgs
+
+    msg = Message("user", "```python\n[1, 2, 3]\n```")
+
+    outputs = format_msgs([msg], highlight=True)
+    assert len(outputs) == 1
+    # Code blocks should still work with syntax highlighting
+
+
+def test_format_msgs_strips_think_sig():
+    """Test that think-sig comments are stripped but think blocks remain."""
+    from gptme.message import Message, format_msgs
+
+    msg = Message(
+        "assistant",
+        "<think>\nreasoning\n<!-- think-sig: sig123\nwrapped -->\n</think>\n\nActual response",
+    )
+    outputs = format_msgs([msg])
+    content = outputs[0]
+
+    assert "reasoning" in content
+    assert "think-sig" not in content
+    assert "Actual response" in content
+    assert "<think>" in content
+
+
+def test_format_msgs_preserves_think_blocks():
+    """Test that multiline think blocks are still shown."""
+    from gptme.message import Message, format_msgs
+
+    msg = Message(
+        "assistant",
+        "<think>\nGood, another solid turn.\n</think>\n\nClean. Everything works.",
+    )
+    outputs = format_msgs([msg])
+    content = outputs[0]
+    assert "Good, another solid turn" in content
+    assert "<think>" in content
+    assert "</think>" in content
+    assert "Clean. Everything works" in content
+
+
+def test_format_msgs_strips_standalone_think_sig():
+    """Test that bare multiline think-sig comments are stripped."""
+    from gptme.message import Message, format_msgs
+
+    msg = Message(
+        "assistant",
+        "Before\n<!-- think-sig: abc123\nwrapped-signature -->\nAfter",
+    )
+    outputs = format_msgs([msg])
+    content = outputs[0]
+
+    assert "Before" in content
+    assert "After" in content
+    assert "think-sig" not in content
+    assert "wrapped-signature" not in content
+
+
+def test_format_msgs_terminal_projection_default_uses_display_content():
+    """By default (terminal rendering), the reduced terminal_display_content
+    is shown in place of the complete content, when set."""
+    from gptme.message import Message, format_msgs
+
+    msg = Message(
+        "system",
+        "Executed code block.\n\nResult:\n```\nfull stdout that was streamed live\n```",
+        terminal_display_content="Executed code block.",
+    )
+    (content,) = format_msgs([msg])
+    assert "full stdout that was streamed live" not in content
+    assert "Executed code block." in content
+
+
+def test_format_msgs_terminal_projection_false_uses_complete_content():
+    """Callers that feed the formatted text back into an LLM (e.g.
+    summarization) must see the complete content, not the reduced
+    terminal-only projection — see gptme#3708."""
+    from gptme.message import Message, format_msgs
+
+    msg = Message(
+        "system",
+        "Executed code block.\n\nResult:\n```\nfull stdout that was streamed live\n```",
+        terminal_display_content="Executed code block.",
+    )
+    (content,) = format_msgs([msg], terminal_projection=False)
+    assert "full stdout that was streamed live" in content
+
+
+def test_native_ipython_display_preserves_raw_message_and_arguments():
+    from gptme.message import format_msgs
+
+    code = "values = [1, 2]\nprint(values)"
+    raw_call = "@ipython(call_1): " + json.dumps(
+        {"code": code, "kernel": "python3", "options": {"timeout": 3, "quiet": False}}
+    )
+    msg = Message("assistant", "Before\n" + raw_call + "\nAfter")
+    original = msg.to_dict()
+
+    (display,) = format_msgs([msg])
+    assert "@ipython(call_1):" in display
+    assert code in display
+    assert '"kernel": "python3"' in display
+    assert '"options": {"timeout": 3, "quiet": false}' in display
+    assert display.index("Before") < display.index(code) < display.index("After")
+    assert '"code":' not in display
+    assert msg.to_dict() == original
+    assert raw_call in format_msgs([msg], terminal_projection=False)[0]
+
+
+def test_native_ipython_highlight_preserves_literal_source(monkeypatch):
+    from rich.console import Console
+    from rich.text import Text
+
+    from gptme.message import print_msg
+
+    code = 'values = [1, 2]\nprint("```python [bold]literal[/bold]")\nprint(values)'
+    msg = Message("assistant", "@ipython(call_2): " + json.dumps({"code": code}))
+    captured = StringIO()
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(
+        "gptme.message.console",
+        Console(file=captured, force_terminal=True, no_color=False, width=120),
+    )
+
+    assert print_msg(msg, highlight=True) == 1
+    rendered = Text.from_ansi(captured.getvalue())
+    assert code in rendered.plain
+    # Python identifiers get syntax styles; the role label alone is insufficient.
+    source_start = rendered.plain.index("values =")
+    assert any(span.start <= source_start < span.end for span in rendered.spans)
+    assert msg.content == "@ipython(call_2): " + json.dumps({"code": code})
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"code": "unterminated',
+        '{"code": "print(1)", broken}',
+    ],
+)
+def test_native_ipython_unrenderable_arguments_remain_raw(arguments):
+    from gptme.message import format_msgs
+
+    raw = "@ipython(call_3): " + arguments
+    msg = Message("assistant", raw)
+    assert format_msgs([msg])[0] == "Assistant: " + raw
+    assert msg.content == raw
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"kernel": "[bold]literal[/bold]"}',
+        '{"code": ["not source"]}',
+    ],
+)
+def test_native_tool_without_string_body_uses_json_fallback(arguments):
+    from gptme.message import format_msgs
+
+    raw = "@ipython(call_3): " + arguments
+    msg = Message("assistant", raw)
+    display = format_msgs([msg])[0]
+    assert "@ipython(call_3):" in display
+    assert "[bold]literal[/bold]" in display or "not source" in display
+    assert msg.content == raw
+
+
+def test_native_shell_display_highlights_command():
+    from gptme.message import format_msgs
+
+    command = 'pwd && echo "done"'
+    raw = "@shell(call_2): " + json.dumps({"command": command})
+    msg = Message("assistant", "Before\n" + raw + "\nAfter")
+    original = msg.to_dict()
+    (display,) = format_msgs([msg])
+    assert "@shell(call_2):" in display
+    assert command in display
+    assert '"command":' not in display
+    assert display.index("Before") < display.index("pwd") < display.index("After")
+    assert msg.to_dict() == original
+    assert raw in format_msgs([msg], terminal_projection=False)[0]
+
+
+def test_native_save_keeps_path_argument_and_projects_content():
+    from gptme.message import format_msgs
+
+    source = "def x():\n    return 1\n"
+    raw = "@save(s1): " + json.dumps({"path": "foo.py", "content": source})
+    msg = Message("assistant", raw)
+    (display,) = format_msgs([msg])
+    assert "@save(s1):" in display
+    assert "foo.py" in display
+    assert "def x():" in display
+    assert '"content":' not in display
+    assert msg.content == raw
+
+
+def test_native_read_without_body_uses_json_fallback():
+    from gptme.message import format_msgs
+
+    raw = "@read(r1): " + json.dumps({"path": "README.md", "start_line": 1})
+    msg = Message("assistant", raw)
+    (display,) = format_msgs([msg])
+    assert "@read(r1):" in display
+    assert "README.md" in display
+    assert "start_line" in display
+    assert msg.content == raw
+
+
+@pytest.mark.parametrize("fence", ["```", "````", "~~~", "   ```"])
+def test_native_ipython_fenced_examples_keep_existing_rendering(fence):
+    from gptme.message import format_msgs
+
+    raw = '@ipython(example): {"code": "print(1)\\nprint(2)"}'
+    msg = Message("assistant", fence + "text\n" + raw + "\n" + fence)
+    assert format_msgs([msg]) == format_msgs([msg], terminal_projection=False)
+
+
+@pytest.mark.parametrize("role", ["user", "system"])
+def test_native_ipython_examples_in_other_roles_remain_raw(role):
+    from gptme.message import format_msgs
+
+    raw = '@ipython(example): {"code": "print(1)\\nprint(2)"}'
+    msg = Message(role, raw)
+    assert format_msgs([msg])[0].endswith(raw)
+
+
+def test_message_files_resolve_to_absolute(tmp_path, monkeypatch):
+    """Test that file paths are resolved to absolute paths when serializing.
+
+    This prevents issues when the working directory changes after attaching
+    files to a message. See issue #262.
+    """
+    import os
+
+    from gptme.message import Message
+
+    # Create a test file in tmp_path
+    test_file = tmp_path / "test_image.png"
+    test_file.write_bytes(b"fake image data")
+
+    # Change to tmp_path and create a message with a relative path
+    original_cwd = os.getcwd()
+    try:
+        monkeypatch.chdir(tmp_path)
+        msg = Message("user", "Check this image", files=[Path("test_image.png")])
+
+        # Serialize the message
+        d = msg.to_dict()
+
+        # The file path should be absolute in the serialized dict
+        assert d["files"][0] == str(test_file.resolve())
+        assert Path(d["files"][0]).is_absolute()
+
+        # Change to a different directory
+        other_dir = tmp_path / "other"
+        other_dir.mkdir()
+        monkeypatch.chdir(other_dir)
+
+        # Deserialize and verify the path still works
+        # (simulating what logmanager._gen_read_jsonl does)
+        loaded_files: list[FilePath] = [Path(f) for f in d.get("files", [])]
+        loaded_msg = Message(
+            d["role"],
+            d["content"],
+            files=loaded_files,
+        )
+        assert len(loaded_msg.files) == 1
+        file_ref = loaded_msg.files[0]
+        assert isinstance(file_ref, Path) and file_ref.exists()
+    finally:
+        os.chdir(original_cwd)
+
+
+def test_toml_file_hashes():
+    """Test that file_hashes survive TOML round-trip."""
+
+    # Use full path as key (not just basename) to avoid collisions
+    msg = Message(
+        "user",
+        "Check this file",
+        files=[Path("/tmp/test.py")],
+        file_hashes={"/tmp/test.py": "abc123def456"},
+    )
+
+    # Round-trip through TOML
+    toml_str = msg.to_toml()
+    loaded = Message.from_toml(toml_str)
+
+    # Verify file_hashes survived
+    assert loaded.file_hashes == msg.file_hashes
+    assert loaded.file_hashes.get("/tmp/test.py") == "abc123def456"
+
+
+def test_file_hashes_no_collision_same_basename():
+    """Test that files with same basename but different paths don't collide."""
+
+    # Two files with the same basename but different paths
+    msg = Message(
+        "user",
+        "Check these files",
+        files=[Path("/src/utils/test.py"), Path("/tests/test.py")],
+        file_hashes={
+            "/src/utils/test.py": "hash_for_src_utils",
+            "/tests/test.py": "hash_for_tests",
+        },
+    )
+
+    # Both files should have distinct hashes
+    assert len(msg.file_hashes) == 2
+    assert msg.file_hashes.get("/src/utils/test.py") == "hash_for_src_utils"
+    assert msg.file_hashes.get("/tests/test.py") == "hash_for_tests"
+
+    # Round-trip through TOML should preserve both
+    toml_str = msg.to_toml()
+    loaded = Message.from_toml(toml_str)
+    assert loaded.file_hashes == msg.file_hashes
+
+
+def test_message_metadata():
+    """Test that metadata survives JSONL and TOML round-trips."""
+    import json
+
+    from gptme.message import Message, MessageMetadata
+
+    # Create message with metadata using nested usage format
+    meta: MessageMetadata = {
+        "model": "claude-sonnet",
+        "cost": 0.005,
+        "tool": "shell",
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_read_tokens": 80,
+            "cache_creation_tokens": 10,
+        },
+    }
+    msg = Message(role="assistant", content="Hello world", metadata=meta)
+
+    # Verify metadata stored correctly
+    assert msg.metadata is not None
+    assert msg.metadata["model"] == "claude-sonnet"
+    assert msg.metadata["cost"] == 0.005
+    assert msg.metadata["tool"] == "shell"
+    usage = msg.metadata["usage"]
+    assert usage["input_tokens"] == 100
+    assert usage["output_tokens"] == 50
+    assert usage["cache_read_tokens"] == 80
+    assert usage["cache_creation_tokens"] == 10
+
+    # Test JSON/JSONL roundtrip
+    d = msg.to_dict()
+    assert "metadata" in d
+    assert "usage" in d["metadata"]
+    json_str = json.dumps(d)
+    json_data = json.loads(json_str)
+    from dateutil.parser import isoparse
+
+    json_data["timestamp"] = isoparse(json_data["timestamp"])
+    msg2 = Message(**json_data)
+    assert msg2.metadata == meta
+
+    # Test TOML roundtrip
+    toml_str = msg.to_toml()
+    msg3 = Message.from_toml(toml_str)
+    assert msg3.metadata == meta
+
+
+def test_message_metadata_artifacts_roundtrip():
+    """Tool-emitted artifact descriptors (list of dicts) survive round-trips.
+
+    Phase 2 of ErikBjare/bob#830 stores ``artifacts`` as a list of inline
+    tables in metadata; this guards both the JSON and TOML serializers.
+    """
+    import json
+
+    from dateutil.parser import isoparse
+
+    from gptme.message import Message, MessageMetadata
+
+    meta: MessageMetadata = {
+        "model": "claude-sonnet",
+        "artifacts": [
+            {
+                "source_type": "attachment",
+                "path": "attachments/plot.png",
+                "kind": "image",
+                "title": "plot.png",
+                "tool": "python",
+            },
+            {
+                "source_type": "external",
+                "url": "https://example.com/report.pdf",
+                "tool": "browser",
+            },
+        ],
+    }
+    msg = Message(role="assistant", content="Generated a plot", metadata=meta)
+
+    # JSON/JSONL roundtrip
+    d = msg.to_dict()
+    json_data = json.loads(json.dumps(d))
+    json_data["timestamp"] = isoparse(json_data["timestamp"])
+    msg2 = Message(**json_data)
+    assert msg2.metadata == meta
+
+    # TOML roundtrip (list of inline tables)
+    toml_str = msg.to_toml()
+    msg3 = Message.from_toml(toml_str)
+    assert msg3.metadata is not None
+    artifacts3 = msg3.metadata["artifacts"]
+    assert [a["source_type"] for a in artifacts3] == ["attachment", "external"]
+    assert artifacts3[0]["tool"] == "python"
+    assert artifacts3[1]["url"] == "https://example.com/report.pdf"
+
+
+def test_message_metadata_migration():
+    """Test backward-compatible migration from flat to nested usage format."""
+    import json
+
+    from gptme.message import Message, _migrate_metadata
+
+    # Old flat format (as stored in existing logs)
+    flat_meta = {
+        "model": "claude-sonnet",
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "cache_read_tokens": 80,
+        "cache_creation_tokens": 10,
+        "cost": 0.005,
+    }
+
+    # Migration should nest token fields under "usage"
+    migrated = _migrate_metadata(flat_meta)
+    assert migrated["model"] == "claude-sonnet"
+    assert migrated["cost"] == 0.005
+    assert "usage" in migrated
+    assert migrated["usage"]["input_tokens"] == 100
+    assert migrated["usage"]["output_tokens"] == 50
+    assert migrated["usage"]["cache_read_tokens"] == 80
+    assert migrated["usage"]["cache_creation_tokens"] == 10
+    # Flat token keys should NOT be at top level
+    assert "input_tokens" not in migrated
+    assert "output_tokens" not in migrated
+
+    # Already-migrated format should pass through unchanged
+    nested_meta = {
+        "model": "claude-sonnet",
+        "cost": 0.005,
+        "usage": {"input_tokens": 100, "output_tokens": 50},
+    }
+    migrated2 = _migrate_metadata(nested_meta)
+    assert migrated2 == nested_meta
+
+    # JSONL round-trip with old flat format should auto-migrate
+    old_json = json.dumps(
+        {
+            "role": "assistant",
+            "content": "Hello",
+            "timestamp": "2025-01-01T00:00:00",
+            "metadata": flat_meta,
+        }
+    )
+    from dateutil.parser import isoparse
+
+    json_data = json.loads(old_json)
+    json_data["timestamp"] = isoparse(json_data["timestamp"])
+    json_data["metadata"] = _migrate_metadata(json_data["metadata"])
+    msg = Message(**json_data)
+    assert msg.metadata is not None
+    assert "usage" in msg.metadata
+    assert msg.metadata["usage"]["input_tokens"] == 100
+
+
+def test_message_metadata_none():
+    """Test that messages without metadata work correctly."""
+    import json
+
+    from gptme.message import Message
+
+    # Create message without metadata
+    msg = Message(role="user", content="Hello")
+
+    # Verify no metadata
+    assert msg.metadata is None
+
+    # to_dict should NOT include metadata key for compact storage
+    d = msg.to_dict()
+    assert "metadata" not in d
+
+    # JSONL roundtrip
+    json_str = json.dumps(d)
+    json_data = json.loads(json_str)
+    from dateutil.parser import isoparse
+
+    json_data["timestamp"] = isoparse(json_data["timestamp"])
+    msg2 = Message(**json_data)
+    assert msg2.metadata is None
+
+    # TOML roundtrip
+    toml_str = msg.to_toml()
+    msg3 = Message.from_toml(toml_str)
+    assert msg3.metadata is None
+
+
+def test_to_xml_escapes_special_characters():
+    """Test that to_xml properly escapes XML special characters."""
+    from gptme.message import Message
+
+    # Test content with XML special characters
+    msg = Message(role="user", content="Use <tag> and & symbol")
+    xml_str = msg.to_xml()
+
+    # Content should be escaped
+    assert "&lt;tag&gt;" in xml_str
+    assert "&amp;" in xml_str
+
+    # Role should be properly quoted
+    assert 'role="user"' in xml_str
+
+
+def test_to_xml_handles_quotes_in_role():
+    """Test that to_xml handles quotes in role attribute."""
+    from gptme.message import Message
+
+    # Create a message - role with special chars is unusual but should be safe
+    msg = Message(role="user", content='Test content with "quotes"')
+    xml_str = msg.to_xml()
+
+    # Quotes in content should be safe (no escaping needed for XML content)
+    assert 'Test content with "quotes"' in xml_str
+
+
+def test_message_equality_ignores_timestamp():
+    """Test that Message equality is based on role and content, not timestamp."""
+    msg1 = Message("user", "Hello", timestamp=datetime(2025, 1, 1, tzinfo=timezone.utc))
+    msg2 = Message("user", "Hello", timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    msg3 = Message("user", "World", timestamp=datetime(2025, 1, 1, tzinfo=timezone.utc))
+    msg4 = Message(
+        "assistant", "Hello", timestamp=datetime(2025, 1, 1, tzinfo=timezone.utc)
+    )
+
+    # Same role + content = equal, regardless of timestamp
+    assert msg1 == msg2
+
+    # Different content = not equal
+    assert msg1 != msg3
+
+    # Different role = not equal
+    assert msg1 != msg4
+
+    # Not equal to non-Message
+    assert msg1 != "not a message"
+
+
+def test_message_hash_consistent_with_equality():
+    """Test that Message hash is consistent with equality (equal objects hash the same)."""
+    msg1 = Message("user", "Hello", timestamp=datetime(2025, 1, 1, tzinfo=timezone.utc))
+    msg2 = Message("user", "Hello", timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    msg3 = Message("user", "World")
+
+    # Equal messages must have equal hashes
+    assert hash(msg1) == hash(msg2)
+
+    # Different messages should (likely) have different hashes
+    assert hash(msg1) != hash(msg3)
+
+    # Messages work correctly in sets
+    s = {msg1, msg2, msg3}
+    assert len(s) == 2  # msg1 and msg2 are equal, so only 2 unique
+
+
+def test_toml_preserves_whitespace():
+    """Test that from_toml preserves leading/trailing whitespace in content.
+
+    Note: TOML multiline strings add a trailing newline due to format:
+        content = '''
+        {content}
+        '''
+    So we test that leading whitespace and internal structure is preserved.
+    """
+    # Content with intentional leading whitespace
+    content_with_whitespace = "  \n  code with indentation  \n"
+    msg = Message(
+        "user",
+        content_with_whitespace,
+        timestamp=datetime.now(tz=timezone.utc),
+    )
+
+    # Roundtrip through TOML
+    toml_str = msg.to_toml()
+    restored = Message.from_toml(toml_str)
+
+    # Leading whitespace should be preserved
+    assert restored.content.startswith("  \n")
+    # Internal structure preserved
+    assert "  code with indentation" in restored.content
+    # Should not be fully stripped to just the words
+    assert restored.content != "code with indentation"
+
+
+def test_call_id_serialization():
+    """Test that call_id=None doesn't serialize as literal string 'None'.
+
+    Issue #1035: call_id=None was being serialized as 'call_id = "None"'
+    which then gets parsed back as the string "None" instead of None.
+    """
+    # Message without call_id (default None)
+    msg_no_callid = Message(
+        "assistant",
+        "Hello",
+        timestamp=datetime.now(tz=timezone.utc),
+    )
+
+    # Verify call_id = "None" is NOT in the TOML output
+    toml_str = msg_no_callid.to_toml()
+    assert 'call_id = "None"' not in toml_str
+    assert "call_id" not in toml_str  # Should not appear at all
+
+    # Roundtrip should preserve None
+    restored = Message.from_toml(toml_str)
+    assert restored.call_id is None
+
+    # Message with call_id should serialize and roundtrip correctly
+    msg_with_callid = Message(
+        "assistant",
+        "Tool response",
+        timestamp=datetime.now(tz=timezone.utc),
+        call_id="call_abc123",
+    )
+
+    toml_str_with = msg_with_callid.to_toml()
+    assert 'call_id = "call_abc123"' in toml_str_with
+
+    restored_with = Message.from_toml(toml_str_with)
+    assert restored_with.call_id == "call_abc123"
+
+
+def test_message_concat():
+    """Test Message.concat properly merges all relevant fields."""
+    from pathlib import Path
+
+    msg1 = Message(
+        "user",
+        "First message",
+        files=[Path("/tmp/file1.png")],
+        file_hashes={"/tmp/file1.png": "hash1"},
+    )
+    msg2 = Message(
+        "user",
+        "Second message",
+        files=[Path("/tmp/file2.png")],
+        file_hashes={"/tmp/file2.png": "hash2"},
+        pinned=True,
+    )
+
+    # Test basic concatenation
+    merged = msg1.concat(msg2)
+    assert merged.role == "user"
+    assert merged.content == "First message\n\nSecond message"
+    assert len(merged.files) == 2
+    assert Path("/tmp/file1.png") in merged.files
+    assert Path("/tmp/file2.png") in merged.files
+
+    # Test file_hashes are merged
+    assert merged.file_hashes == {
+        "/tmp/file1.png": "hash1",
+        "/tmp/file2.png": "hash2",
+    }
+
+    # Test pinned is preserved if either message is pinned
+    assert merged.pinned is True
+
+    # Test quiet is preserved if either message is quiet
+    msg_quiet = Message("user", "Quiet message", quiet=True)
+    msg_normal = Message("user", "Normal message")
+    assert msg_quiet.concat(msg_normal).quiet is True
+    assert msg_normal.concat(msg_quiet).quiet is True
+    assert msg_normal.concat(msg_normal).quiet is False
+
+    # Test custom separator
+    merged_custom = msg1.concat(msg2, separator=" | ")
+    assert merged_custom.content == "First message | Second message"
+
+
+def test_message_concat_different_roles_raises():
+    """Test that concat raises ValueError for different roles."""
+    import pytest
+
+    msg1 = Message("user", "User message")
+    msg2 = Message("assistant", "Assistant message")
+
+    with pytest.raises(ValueError, match="different roles"):
+        msg1.concat(msg2)
+
+
+def test_message_concat_preserves_images():
+    """Test that concat preserves image files for vision models."""
+    from pathlib import Path
+
+    # Simulates system message converted to user + original user with image
+    system_as_user = Message(
+        "user",
+        "<system>You are a helpful assistant</system>",
+    )
+    user_with_image = Message(
+        "user",
+        "/path/to/image.png",
+        files=[Path("/path/to/image.png")],
+        file_hashes={"/path/to/image.png": "abc123"},
+    )
+
+    # This is what _merge_consecutive does
+    merged = system_as_user.concat(user_with_image)
+
+    # The image should be preserved
+    assert len(merged.files) == 1
+    assert Path("/path/to/image.png") in merged.files
+    assert merged.file_hashes.get("/path/to/image.png") == "abc123"
+
+
+def test_message_metadata_reasoning_fields_roundtrip():
+    """reasoning_effort / usage.reasoning_tokens survive dict + JSON round trips."""
+    import json
+
+    from gptme.message import Message, MessageMetadata
+
+    meta: MessageMetadata = {
+        "model": "openai/gpt-5",
+        "reasoning_effort": "high",
+        "usage": {"input_tokens": 10, "output_tokens": 40, "reasoning_tokens": 25},
+    }
+    from dateutil.parser import isoparse
+
+    msg = Message("assistant", "ok", metadata=meta)
+    d = json.loads(json.dumps(msg.to_dict()))
+    d["timestamp"] = isoparse(d["timestamp"])
+    assert Message(**d).metadata == meta
+    restored = Message.from_toml(msg.to_toml())
+    assert restored.metadata == meta
+    assert restored.metadata["reasoning_effort"] == "high"
+    assert restored.metadata["usage"]["reasoning_tokens"] == 25
+
+
+def test_message_metadata_migration_nests_reasoning_tokens():
+    from gptme.message import _migrate_metadata
+
+    migrated = _migrate_metadata(
+        {"model": "openai/gpt-5", "output_tokens": 40, "reasoning_tokens": 25}
+    )
+    assert migrated["usage"] == {"output_tokens": 40, "reasoning_tokens": 25}
+    assert "reasoning_tokens" not in migrated

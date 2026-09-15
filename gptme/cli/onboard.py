@@ -1,0 +1,427 @@
+"""
+First-run onboarding wizard for gptme.
+
+Usage:
+    gptme-onboard              # Run the setup wizard
+    gptme-onboard --check      # Check current setup status
+"""
+
+import logging
+import os
+import sys
+from pathlib import Path
+from typing import cast
+
+import click
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Confirm, Prompt
+from rich.table import Table
+
+from ..config import config_path
+from ..llm import list_available_providers
+from ..llm.models import MODELS, PROVIDERS, BuiltinProvider, get_recommended_model
+from ..llm.validate import OAUTH_PROVIDERS, PROVIDER_DOCS, validate_api_key
+
+logger = logging.getLogger(__name__)
+console = Console()
+
+# Environment variable patterns for each provider (used by detection and testing)
+PROVIDER_ENV_VARS = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "xai": "XAI_API_KEY",
+    "azure": "AZURE_OPENAI_API_KEY",
+}
+
+
+def _detect_providers() -> dict[str, tuple[bool, str | None]]:
+    """
+    Detect which providers have API keys configured (in env or config file).
+
+    Checks environment variables first, then falls back to the config file
+    for API keys stored in the ``[env]`` section or a model set in ``[chat]``.
+
+    Returns:
+        Dict mapping provider name to (has_key, key_preview)
+    """
+    results: dict[str, tuple[bool, str | None]] = {}
+
+    # Check environment variables (highest priority, shows key preview)
+    for provider, env_var in PROVIDER_ENV_VARS.items():
+        key = os.environ.get(env_var)
+        if key:
+            # Preview: show first 4 and last 4 chars
+            preview = f"{key[:4]}...{key[-4:]}" if len(key) > 10 else "***"
+            results[provider] = (True, preview)
+        else:
+            results[provider] = (False, None)
+
+    # OAuth providers have no API key; use the same token-file detection as the
+    # runtime and ``gptme-doctor``. Credential/config errors must not discard
+    # providers already detected from the environment.
+    try:
+        for provider, source in list_available_providers():
+            if provider in OAUTH_PROVIDERS:
+                results[provider] = (True, source)
+    except (OSError, ValueError) as e:
+        logger.warning(
+            "OAuth credential check failed: %s — run `gptme auth` to re-authenticate", e
+        )
+
+    # Also check config file for API keys and configured model
+    try:
+        from ..config import get_config
+
+        config = get_config()
+
+        # Check config [env] section for API keys not found in environment
+        for provider, env_var in PROVIDER_ENV_VARS.items():
+            if not results.get(provider, (False,))[0]:
+                config_key = config.get_env(env_var)
+                if config_key:
+                    preview = (
+                        f"{config_key[:4]}...{config_key[-4:]}"
+                        if len(config_key) > 10
+                        else "***"
+                    )
+                    results[provider] = (True, f"{preview} (config)")
+
+        # Check if a model is already configured (implies provider is available)
+        model = (config.chat.model if config.chat else None) or config.get_env("MODEL")
+        if model and "/" in model:
+            provider_name = model.split("/")[0]
+            if provider_name in results and not results[provider_name][0]:
+                results[provider_name] = (True, f"(model: {model})")
+    except Exception:
+        pass  # Config not available yet — env var detection is sufficient
+
+    return results
+
+
+def _test_provider(provider: str) -> tuple[bool, str]:
+    """Test if a provider is working (checks env vars and config file)."""
+    if provider in OAUTH_PROVIDERS:
+        try:
+            available = {name for name, _ in list_available_providers()}
+        except (OSError, ValueError) as e:
+            logger.warning(
+                "OAuth credential check failed: %s — run `gptme auth %s` to re-authenticate",
+                e,
+                provider,
+            )
+            return False, f"Could not read OAuth credentials: {e}"
+        if provider in available:
+            return True, "OAuth credentials found (not validated during onboarding)"
+        return False, f"Not authenticated (run gptme auth {provider})"
+
+    env_var = PROVIDER_ENV_VARS.get(provider)
+    if not env_var:
+        return False, f"Unknown provider: {provider}"
+
+    # Check env var first, then config file
+    api_key = os.environ.get(env_var)
+    if not api_key:
+        try:
+            from ..config import get_config
+
+            api_key = get_config().get_env(env_var)
+        except Exception:
+            pass
+    if not api_key:
+        return False, f"No API key found (set {env_var})"
+
+    return validate_api_key(api_key, provider)
+
+
+def _show_provider_status(providers: dict[str, tuple[bool, str | None]]) -> None:
+    """Display provider status in a nice table."""
+    table = Table(title="API Provider Status")
+    table.add_column("Provider", style="cyan")
+    table.add_column("Status", style="green")
+    table.add_column("Key Preview")
+    table.add_column("Docs")
+
+    # Show all builtin providers plus any additional (e.g. OAuth) providers
+    # detected in `providers` that aren't in the builtin list, so a
+    # configured OAuth provider isn't silently omitted from the table.
+    all_providers = list(PROVIDERS) + [p for p in providers if p not in PROVIDERS]
+    for provider in all_providers:
+        has_key, preview = providers.get(provider, (False, None))
+        if has_key:
+            status = "✅ Configured"
+            preview_text = preview or "***"
+        else:
+            status = "❌ Not configured"
+            preview_text = "-"
+
+        docs_url = PROVIDER_DOCS.get(provider, "")
+        table.add_row(provider, status, preview_text, docs_url)
+
+    console.print(table)
+
+
+def _get_default_model(provider: str) -> str:
+    """Return a valid default model string for the given provider.
+
+    For providers with a builtin recommended model, returns ``provider/model``.
+    For OAuth/subscription providers that have no builtin recommendation, falls
+    back to the first model listed in the static ``MODELS`` dict so the default
+    is always a fully-qualified ``provider/model`` string rather than the bare
+    provider name (which fails at startup).
+
+    Returns an empty string if no default model can be determined.
+    Callers must treat an empty return as "no default available" and require
+    the user to supply a full ``provider/model`` string explicitly.
+    """
+    if provider in PROVIDERS:
+        try:
+            rec = get_recommended_model(cast(BuiltinProvider, provider))
+            return f"{provider}/{rec}"
+        except ValueError:
+            pass
+    # Fallback: first model in the static MODELS dict, if any.
+    # MODELS keys are Literal types; cast provider str to avoid the mypy overload mismatch.
+    provider_models = list(MODELS.get(cast(BuiltinProvider, provider), {}).keys())
+    if provider_models:
+        return f"{provider}/{provider_models[0]}"
+    # No default known — returning the bare provider name would produce an invalid
+    # config (runtime requires provider/model).  Let the caller ask the user.
+    return ""
+
+
+def _select_provider(providers: dict[str, tuple[bool, str | None]]) -> str | None:
+    """Let user select a provider from available ones."""
+    available = [p for p, (has_key, _) in providers.items() if has_key]
+
+    if not available:
+        return None
+
+    # Show selection prompt
+    console.print("\n[bold]Available providers:[/bold]")
+    for i, provider in enumerate(available, 1):
+        # Cast to BuiltinProvider for type safety (we only support builtins here)
+        if provider in PROVIDERS:
+            try:
+                rec_model = get_recommended_model(cast(BuiltinProvider, provider))
+                console.print(f"  {i}. {provider} (recommended: {rec_model})")
+            except ValueError:
+                # Provider doesn't have a recommended model configured
+                console.print(f"  {i}. {provider}")
+        else:
+            console.print(f"  {i}. {provider}")
+
+    default_choice = "1" if available else ""
+    while True:
+        choice = Prompt.ask(
+            "\nSelect provider (number or name)", default=default_choice
+        )
+
+        if not choice:
+            return None
+
+        # Try as number
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(available):
+                return available[idx]
+        except ValueError:
+            pass
+
+        # Try as name
+        if choice.lower() in available:
+            return choice.lower()
+
+        console.print("[red]Invalid selection. Try again.[/red]")
+
+
+def _create_config(provider: str, model: str | None = None) -> Path:
+    """Create initial gptme configuration file."""
+    # Determine config path
+    conf_path = Path(config_path)
+    conf_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if model is None:
+        if provider in PROVIDERS:
+            try:
+                rec_model = get_recommended_model(cast(BuiltinProvider, provider))
+                model = f"{provider}/{rec_model}"
+            except ValueError:
+                # Provider doesn't have a recommended model configured
+                model = provider
+        else:
+            model = provider
+
+    # Create minimal TOML config
+    config_content = f"""# gptme configuration
+# Generated by gptme onboard
+# See: https://gptme.org/docs/config.html
+
+[chat]
+model = "{model}"
+
+# Uncomment to set default tools:
+# tools = ["shell", "python", "browser"]
+
+# Uncomment to enable auto-save:
+# auto_save = true
+"""
+
+    # Check if config already exists
+    if conf_path.exists():
+        console.print(f"\n[yellow]Config already exists at: {conf_path}[/yellow]")
+        if not Confirm.ask("Overwrite existing config?"):
+            console.print("[dim]Skipping config creation.[/dim]")
+            return conf_path
+
+    conf_path.write_text(config_content)
+    console.print(f"\n[green]✅ Config created at: {conf_path}[/green]")
+
+    return conf_path
+
+
+def _run_wizard(check_only: bool = False) -> int:
+    """Run the onboarding wizard."""
+    console.print(
+        Panel.fit(
+            "[bold blue]gptme Onboarding Wizard[/bold blue]\n\n"
+            "This wizard will help you set up gptme with your preferred AI provider.",
+            title="Welcome",
+            border_style="blue",
+        )
+    )
+
+    # Step 1: Detect providers
+    console.print("\n[bold]Step 1: Detecting API providers...[/bold]")
+    providers = _detect_providers()
+    _show_provider_status(providers)
+
+    available_providers = [p for p, (has_key, _) in providers.items() if has_key]
+
+    if not available_providers:
+        console.print("\n[red]❌ No provider configured![/red]")
+        console.print("\nTo use gptme, sign in with a subscription or set an API key.")
+        console.print(
+            "\n[bold]Option 1[/bold] — sign in with a subscription you already pay for:"
+        )
+        console.print(
+            "  [cyan]gptme-auth openai-subscription[/cyan]    # ChatGPT Plus/Pro"
+        )
+        console.print("  [cyan]gptme-auth grok-subscription[/cyan]      # SuperGrok")
+        console.print("\n[bold]Option 2[/bold] — set an API key:")
+        console.print("  export ANTHROPIC_API_KEY='sk-ant-...'")
+        console.print("  export OPENAI_API_KEY='sk-...'")
+        console.print("  export OPENROUTER_API_KEY='sk-or-...'")
+        console.print(
+            "\nThen re-run [bold]gptme-onboard[/bold] or just start with [bold]gptme[/bold]."
+        )
+        console.print("\nFull guide: https://gptme.org/docs/getting-started.html")
+        return 1
+
+    if check_only:
+        console.print(
+            f"\n[green]✅ {len(available_providers)} provider(s) configured[/green]"
+        )
+        return 0
+
+    # Step 2: Select provider
+    console.print("\n[bold]Step 2: Select default provider[/bold]")
+    selected = _select_provider(providers)
+
+    if not selected:
+        console.print("[red]No provider selected.[/red]")
+        return 1
+
+    console.print(f"\n[green]Selected: {selected}[/green]")
+
+    # Step 3: Test connectivity
+    console.print(f"\n[bold]Step 3: Testing {selected} connectivity...[/bold]")
+    is_valid, error = _test_provider(selected)
+
+    if is_valid:
+        if error:
+            console.print(f"[yellow]⚠️ {error}[/yellow]")
+        else:
+            console.print(f"[green]✅ Successfully connected to {selected}![/green]")
+    else:
+        console.print(f"[yellow]⚠️ Connection test failed: {error}[/yellow]")
+        if not Confirm.ask("Continue anyway?"):
+            return 1
+
+    # Step 4: Create config
+    console.print("\n[bold]Step 4: Create configuration[/bold]")
+
+    # Ask for model preference
+    default_model = _get_default_model(selected)
+    if selected in OAUTH_PROVIDERS:
+        # Show a hint for OAuth providers so the user knows the required format.
+        example = f" (e.g. {default_model})" if default_model else ""
+        console.print(
+            f"[dim]Note: {selected} requires specifying a model.  "
+            f"Enter it as [bold]{selected}/MODEL-NAME[/bold]{example}.[/dim]"
+        )
+    while True:
+        if default_model:
+            model = Prompt.ask("Default model", default=default_model)
+        else:
+            model = Prompt.ask("Default model (e.g. provider/model-name)")
+        provider, separator, model_name = model.partition("/")
+        if (
+            separator
+            and provider == selected
+            and model_name
+            and not model_name.endswith("/")
+        ):
+            break
+        console.print(
+            f"[red]Model must start with {selected}/ followed by a model name (e.g. {selected}/MODEL-NAME).[/red]"
+        )
+
+    # Create config
+    config_created = _create_config(selected, model)
+
+    # Final summary
+    console.print(
+        Panel.fit(
+            f"[green]✅ Setup complete![/green]\n\n"
+            f"Provider: {selected}\n"
+            f"Model: {model}\n"
+            f"Config: {config_created}\n\n"
+            f"Run [bold]gptme[/bold] to start chatting!",
+            title="🎉 Ready to go!",
+            border_style="green",
+        )
+    )
+
+    return 0
+
+
+@click.command()
+@click.option("--check", is_flag=True, help="Check setup status without making changes")
+@click.option("-v", "--verbose", is_flag=True, help="Enable verbose output")
+def main(check: bool = False, verbose: bool = False) -> None:
+    """
+    First-run onboarding wizard for gptme.
+
+    Helps you:
+    - Detect available API providers
+    - Select your preferred model
+    - Create initial configuration
+    - Test connectivity
+    """
+    if verbose:
+        logging.basicConfig(level=logging.DEBUG)
+
+    try:
+        sys.exit(_run_wizard(check_only=check))
+    except KeyboardInterrupt:
+        console.print("\n[dim]Setup cancelled.[/dim]")
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

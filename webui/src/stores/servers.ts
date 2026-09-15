@@ -1,0 +1,393 @@
+import { observable } from '@legendapp/state';
+import {
+  DEFAULT_SERVER_CONFIG,
+  generateServerId,
+  type ServerConfig,
+  type ServerRegistry,
+} from '@/types/servers';
+
+const STORAGE_KEY = 'gptme_servers';
+
+// Legacy localStorage keys (pre-multi-backend)
+const LEGACY_BASE_URL_KEY = 'gptme_baseUrl';
+const LEGACY_USER_TOKEN_KEY = 'gptme_userToken';
+
+// Vite/Playwright dev servers are not gptme-server; never treat them as the API origin.
+const DEV_SERVER_PORTS = new Set(['5173', '4173', '5701']);
+
+/**
+ * Origin of the bundled web UI when it is served by gptme-server on loopback.
+ *
+ * After gptme#3430, a standalone `gptme-server` requires a bearer token and may
+ * bind a non-5700 port. The bundled UI must talk to `window.location.origin`
+ * in that case — the hardcoded 5700 preset otherwise CORS-retries the wrong
+ * process and never recovers from the same-origin 401.
+ *
+ * Returns null for hosted pages (chat.gptme.org), Vite/Playwright dev servers,
+ * and non-loopback origins.
+ */
+export function getBundledLoopbackOrigin(
+  pageOrigin: string = typeof window !== 'undefined' ? window.location.origin : ''
+): string | null {
+  if (!pageOrigin) return null;
+  try {
+    const parsed = new URL(pageOrigin);
+    const isLoopback = ['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname);
+    if (!isLoopback) return null;
+    if (DEV_SERVER_PORTS.has(parsed.port)) return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+/** Point the stock Local 5700 preset at the bundled UI origin when they differ.
+ *
+ * We match by isPreset + loopback host rather than exact default URL so that
+ * a preset that was previously retargeted and persisted (e.g. to :5799) can
+ * still be found and updated when the server restarts on a new port. */
+export function retargetPresetLocalToBundledOrigin(
+  registry: ServerRegistry,
+  pageOrigin?: string
+): void {
+  const origin = getBundledLoopbackOrigin(pageOrigin);
+  if (!origin) return;
+  const preset = registry.servers.find((s) => {
+    if (!s.isPreset) return false;
+    try {
+      const hostname = new URL(s.baseUrl).hostname;
+      return ['localhost', '127.0.0.1', '[::1]'].includes(hostname);
+    } catch {
+      return false;
+    }
+  });
+  if (!preset) return;
+  if (normalizeUrl(preset.baseUrl) === normalizeUrl(origin)) return;
+  preset.baseUrl = origin;
+}
+
+/** Apply post-parse schema normalization to a registry read from storage.
+ *  Mutates and returns the object. The caller should fall back to
+ *  migrateFromLegacy() if the returned registry has no servers. */
+function normalizeRegistry(parsed: ServerRegistry): ServerRegistry {
+  // Ensure connectedServerIds exists (migration from phase 1 format)
+  if (!parsed.connectedServerIds) {
+    parsed.connectedServerIds = parsed.activeServerId ? [parsed.activeServerId] : [];
+  }
+  // Migrate: remove stale Cloud preset (it pointed at a broken URL)
+  migrateCloudPreset(parsed);
+  // Validate activeServerId points to an existing server
+  if (parsed.servers.length > 0 && !parsed.servers.some((s) => s.id === parsed.activeServerId)) {
+    parsed.activeServerId = parsed.servers[0].id;
+  }
+  // Prune connectedServerIds to only existing servers
+  const serverIds = new Set(parsed.servers.map((s) => s.id));
+  parsed.connectedServerIds = parsed.connectedServerIds.filter((id) => serverIds.has(id));
+  // Ensure activeServerId is in connectedServerIds
+  if (parsed.activeServerId && !parsed.connectedServerIds.includes(parsed.activeServerId)) {
+    parsed.connectedServerIds.push(parsed.activeServerId);
+  }
+  retargetPresetLocalToBundledOrigin(parsed);
+  return parsed;
+}
+
+function loadRegistry(): ServerRegistry {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored) {
+      const parsed = JSON.parse(stored) as ServerRegistry;
+      if (parsed.servers?.length > 0) {
+        const normalized = normalizeRegistry(parsed);
+        // If migration removed all servers, fall through to fresh migration
+        if (normalized.servers.length === 0) return migrateFromLegacy();
+        return normalized;
+      }
+    }
+  } catch {
+    // Corrupted or unavailable storage
+  }
+
+  // Migrate from legacy keys
+  return migrateFromLegacy();
+}
+
+/** Migration: remove stale Cloud preset entries.
+ *  The generic Cloud preset (https://api.gptme.ai) was broken — managed cloud auth returns
+ *  an instance-specific URL, so the hardcoded preset was always stale and causes CSP errors.
+ *  Note: the previous migration only deleted the isPreset flag, so we filter by URL alone
+ *  to also clean up entries that went through the old migration. */
+export function migrateCloudPreset(registry: ServerRegistry): void {
+  const STALE_CLOUD_URL = 'https://api.gptme.ai';
+  const normalized = (url: string) => url.toLowerCase().replace(/\/+$/, '');
+  registry.servers = registry.servers.filter(
+    (s) => normalized(s.baseUrl) !== normalized(STALE_CLOUD_URL)
+  );
+}
+
+function migrateFromLegacy(): ServerRegistry {
+  let baseUrl = getBundledLoopbackOrigin() || DEFAULT_SERVER_CONFIG.baseUrl;
+  let authToken: string | null = null;
+  let useAuthToken = false;
+
+  try {
+    const legacyUrl = localStorage.getItem(LEGACY_BASE_URL_KEY);
+    const legacyToken = localStorage.getItem(LEGACY_USER_TOKEN_KEY);
+
+    if (legacyUrl) baseUrl = legacyUrl;
+    if (legacyToken) {
+      authToken = legacyToken;
+      useAuthToken = true;
+    }
+  } catch {
+    // localStorage unavailable
+  }
+
+  const localServer: ServerConfig = {
+    id: generateServerId(),
+    name: 'Local',
+    baseUrl,
+    authToken,
+    useAuthToken,
+    isPreset: true,
+    createdAt: Date.now(),
+    lastUsedAt: Date.now(),
+  };
+
+  const registry: ServerRegistry = {
+    servers: [localServer],
+    activeServerId: localServer.id,
+    connectedServerIds: [localServer.id],
+  };
+
+  // Clean up legacy keys after migration
+  try {
+    localStorage.removeItem(LEGACY_BASE_URL_KEY);
+    localStorage.removeItem(LEGACY_USER_TOKEN_KEY);
+  } catch {
+    // localStorage unavailable
+  }
+
+  persistRegistry(registry);
+  return registry;
+}
+
+function persistRegistry(registry: ServerRegistry) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(registry));
+  } catch {
+    console.warn('[ServerStore] localStorage unavailable, config will not persist');
+  }
+}
+
+/** Normalize URL for duplicate detection: lowercase, strip trailing slash */
+function normalizeUrl(url: string): string {
+  return url.toLowerCase().replace(/\/+$/, '');
+}
+
+// Initialize the observable
+export const serverRegistry$ = observable<ServerRegistry>(loadRegistry());
+
+// Guard: suppress onChange write-back when we are applying a cross-tab storage event
+// so that the incoming value is not echoed back to localStorage (which would fire
+// another storage event in other tabs and cascade across N tabs).
+let _syncingFromStorage = false;
+
+// Persist on every change (skip during cross-tab sync to prevent cascade)
+serverRegistry$.onChange(({ value }) => {
+  if (!_syncingFromStorage) {
+    persistRegistry(value);
+  }
+});
+
+// Cross-tab sync: re-hydrate when another tab writes gptme_servers to localStorage.
+// This makes the SetupWizard auto-connect promise work for web browser users: when
+// the auth callback lands in tab B and registers a new server, tab A's wizard wakes up.
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (event: StorageEvent) => {
+    if (event.key === STORAGE_KEY && event.newValue) {
+      try {
+        const parsed = JSON.parse(event.newValue) as ServerRegistry;
+        if (parsed.servers?.length > 0) {
+          _syncingFromStorage = true;
+          serverRegistry$.set(normalizeRegistry(parsed));
+          _syncingFromStorage = false;
+        }
+      } catch {
+        // Ignore corrupted storage
+      }
+    }
+  });
+}
+
+export function getActiveServer(): ServerConfig | undefined {
+  const registry = serverRegistry$.get();
+  return registry.servers.find((s) => s.id === registry.activeServerId);
+}
+
+export function setActiveServer(id: string): void {
+  const registry = serverRegistry$.get();
+  const server = registry.servers.find((s) => s.id === id);
+  if (!server) return;
+
+  serverRegistry$.activeServerId.set(id);
+  // Update lastUsedAt
+  const idx = registry.servers.indexOf(server);
+  serverRegistry$.servers[idx].lastUsedAt.set(Date.now());
+}
+
+export function getConnectedServers(): ServerConfig[] {
+  const registry = serverRegistry$.get();
+  return registry.servers.filter((s) => registry.connectedServerIds.includes(s.id));
+}
+
+export function isServerConnected(id: string): boolean {
+  return serverRegistry$.connectedServerIds.get().includes(id);
+}
+
+export function connectServer(id: string): void {
+  const registry = serverRegistry$.get();
+  if (!registry.connectedServerIds.includes(id)) {
+    serverRegistry$.connectedServerIds.push(id);
+  }
+}
+
+export function disconnectServer(id: string): void {
+  const registry = serverRegistry$.get();
+  const idx = registry.connectedServerIds.indexOf(id);
+  if (idx !== -1) {
+    serverRegistry$.connectedServerIds.splice(idx, 1);
+  }
+  // If we disconnected the active server, switch to first remaining connected
+  if (registry.activeServerId === id) {
+    const remaining = serverRegistry$.connectedServerIds.get();
+    if (remaining.length > 0) {
+      serverRegistry$.activeServerId.set(remaining[0]);
+    }
+  }
+}
+
+export function addServer(
+  config: Omit<ServerConfig, 'id' | 'createdAt' | 'lastUsedAt'>
+): ServerConfig {
+  const registry = serverRegistry$.get();
+
+  // Check for duplicate URL
+  const normalized = normalizeUrl(config.baseUrl);
+  const duplicate = registry.servers.find((s) => normalizeUrl(s.baseUrl) === normalized);
+  if (duplicate) {
+    throw new Error(`A server with URL "${config.baseUrl}" already exists: "${duplicate.name}"`);
+  }
+
+  const server: ServerConfig = {
+    ...config,
+    id: generateServerId(),
+    createdAt: Date.now(),
+    lastUsedAt: Date.now(),
+  };
+
+  serverRegistry$.servers.push(server);
+  return server;
+}
+
+export function updateServer(
+  id: string,
+  updates: Partial<Omit<ServerConfig, 'id' | 'createdAt'>>
+): void {
+  const registry = serverRegistry$.get();
+  const idx = registry.servers.findIndex((s) => s.id === id);
+  if (idx === -1) return;
+
+  // Check for duplicate URL if URL is being changed
+  if (updates.baseUrl) {
+    const normalized = normalizeUrl(updates.baseUrl);
+    const duplicate = registry.servers.find(
+      (s) => s.id !== id && normalizeUrl(s.baseUrl) === normalized
+    );
+    if (duplicate) {
+      throw new Error(`A server with URL "${updates.baseUrl}" already exists: "${duplicate.name}"`);
+    }
+  }
+
+  const current = registry.servers[idx];
+  serverRegistry$.servers[idx].set({ ...current, ...updates });
+}
+
+export function removeServer(id: string): void {
+  const registry = serverRegistry$.get();
+  const server = registry.servers.find((s) => s.id === id);
+
+  if (server?.isPreset) {
+    throw new Error('Cannot remove a pre-configured server');
+  }
+
+  if (registry.servers.length <= 1) {
+    throw new Error('Cannot remove the last server');
+  }
+
+  const idx = registry.servers.findIndex((s) => s.id === id);
+  if (idx === -1) return;
+
+  serverRegistry$.servers.splice(idx, 1);
+
+  // Remove from connected list
+  const connIdx = registry.connectedServerIds.indexOf(id);
+  if (connIdx !== -1) {
+    serverRegistry$.connectedServerIds.splice(connIdx, 1);
+  }
+
+  // If we removed the active server, switch to the first remaining one
+  if (registry.activeServerId === id) {
+    const remaining = serverRegistry$.servers.get();
+    if (remaining.length > 0) {
+      serverRegistry$.activeServerId.set(remaining[0].id);
+    }
+  }
+}
+
+/**
+ * Find or create a server by URL. Used when registering servers from URL fragments
+ * or auth code exchange. Returns the server (existing or newly created).
+ */
+export function findOrCreateServerByUrl(
+  baseUrl: string,
+  defaults?: Partial<Omit<ServerConfig, 'id' | 'createdAt' | 'lastUsedAt' | 'baseUrl'>>
+): ServerConfig {
+  const registry = serverRegistry$.get();
+  const normalized = normalizeUrl(baseUrl);
+  const existing = registry.servers.find((s) => normalizeUrl(s.baseUrl) === normalized);
+
+  if (existing) {
+    // Update auth if provided
+    if (defaults?.authToken !== undefined) {
+      updateServer(existing.id, {
+        authToken: defaults.authToken,
+        useAuthToken: defaults.useAuthToken ?? Boolean(defaults.authToken),
+      });
+    }
+    return serverRegistry$.get().servers.find((s) => s.id === existing.id)!;
+  }
+
+  // Derive a name from the URL
+  const name = defaults?.name || deriveServerName(baseUrl);
+  return addServer({
+    name,
+    baseUrl,
+    authToken: defaults?.authToken ?? null,
+    useAuthToken: defaults?.useAuthToken ?? false,
+  });
+}
+
+export function deriveServerName(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const isDefaultPort =
+      !parsed.port ||
+      (parsed.protocol === 'http:' && parsed.port === '80') ||
+      (parsed.protocol === 'https:' && parsed.port === '443');
+    const isLocal = parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost';
+    const base = isLocal ? 'Local' : parsed.hostname;
+    return isDefaultPort ? base : `${base}:${parsed.port}`;
+  } catch {
+    return 'Server';
+  }
+}

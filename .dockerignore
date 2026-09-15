@@ -1,0 +1,85 @@
+# Environment files
+.env*
+.clean
+gptme.toml
+
+venv
+.venv
+
+# worktrees
+dev
+
+# Logs
+*.log
+*logs*
+
+# Outputs
+build
+outputs
+screenshot_*
+
+# Build scripts
+scripts
+!scripts/computer_home
+.github
+
+# Build/test/coverage/docs/prof directories
+dist
+tests
+tests/output
+junit.xml
+.coverage
+coverage.xml
+htmlcov
+prof
+
+# cache
+__pycache__
+.*cache
+
+# docs/demos/projects/evals
+docs
+demos
+projects
+eval_results*
+
+# Desktop/static-site sources and generated frontend files are not needed. The
+# Dockerfiles build the modern UI from source in a dedicated Node stage.
+webui/node_modules
+webui/dist
+webui/playwright-report
+webui/test-results
+tauri
+site
+
+# Specific filetypes
+*.csv
+*.jsonl
+*.gif
+*.cast
+*.png
+
+# Docker-specific excludes
+Dockerfile
+Dockerfile.eval
+docker-compose.yml
+
+# Git directory
+.git
+
+# Python bytecode
+*.pyc
+*.pyo
+*.pyd
+
+# Editor directories
+.vscode
+.idea
+
+# Keep these files/directories
+!pyproject.toml
+!poetry.lock
+!README.md
+!gptme
+!static
+!media

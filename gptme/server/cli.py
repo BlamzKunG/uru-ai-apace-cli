@@ -1,0 +1,441 @@
+import json
+import logging
+import os
+import signal
+import threading
+import time
+from pathlib import Path
+from urllib.parse import quote as urlquote
+
+# Re-entrance guard: SIGTERM can fire while a previous invocation is still
+# running (e.g. during a buffered write).  A module-level flag lets the
+# second invocation exit immediately rather than crashing with
+# "RuntimeError: reentrant call inside <_io.BufferedWriter name='<stderr>'>".
+_sigterm_received = False
+
+
+# Install a minimal SIGTERM handler at module level — before the slow
+# gptme/Flask imports that follow — so SIGTERM during startup produces
+# diagnostic output rather than silently terminating the process
+# (gptme/gptme#3589).  This handler is scoped to the CLI module: it only
+# activates when gptme.server.cli is imported (i.e. the server entrypoint
+# is being used), never when a caller only imports gptme.server.app.
+# _install_sigterm_handler() upgrades it to a logger-aware version once
+# init_logging() has run inside serve().
+def _startup_sigterm_handler(signum: int, frame: object) -> None:
+    global _sigterm_received
+    if _sigterm_received:
+        return
+    _sigterm_received = True
+    # os.write() goes directly to the fd without Python's BufferedWriter, so
+    # it is safe to call from a signal handler (POSIX async-signal-safe).
+    os.write(2, b"Received SIGTERM during startup, shutting down gracefully\n")
+    raise KeyboardInterrupt
+
+
+# Guard against non-main-thread imports (signal.signal raises ValueError
+# from a worker thread) and against overriding a *callable* handler the host
+# process may have installed (e.g. an embedder that sets its own graceful
+# shutdown handler before importing gptme.server.cli).  We install over
+# SIG_DFL (the OS default) and SIG_IGN — the latter may be inherited from a
+# parent process (e.g. a test runner or daemon supervisor) and does not
+# indicate a deliberate embedder choice.  Only an explicit callable handler
+# from the current process is left intact (gptme/gptme#3597).
+if threading.current_thread() is threading.main_thread() and not callable(
+    signal.getsignal(signal.SIGTERM)
+):
+    signal.signal(signal.SIGTERM, _startup_sigterm_handler)
+
+import click
+from click_default_group import DefaultGroup
+
+from gptme.config import set_config_from_workspace
+
+from ..init import init, init_logging
+from ..telemetry import init_telemetry, shutdown_telemetry
+from .app import create_app
+from .auth import get_server_token, init_auth
+from .constants import _pick_fallback_model
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_tools_allowlist(tools: str | None) -> list[str] | None:
+    """Parse the --tools value into an allowlist for init().
+
+    Mirrors the main `gptme` CLI semantics:
+    - ``None`` (flag not passed) -> ``None`` ("use default tools").
+    - ``"none"`` -> ``[]`` (disable all tools). Cannot be combined with
+      other tool names.
+    - otherwise -> the comma-separated list of tool names.
+    """
+    if tools is None:
+        return None
+    names = [t.strip() for t in tools.split(",") if t.strip()]
+    if any(t.lower() == "none" for t in names):
+        non_none = [t for t in names if t.lower() != "none"]
+        if non_none:
+            raise click.UsageError(
+                f"Cannot combine 'none' with other tools: {', '.join(non_none)}"
+            )
+        return []
+    return names
+
+
+def _pid_alive(pid: int) -> bool:
+    """Check if a PID is still alive on this host.
+
+    Uses kill(pid, 0) which sends no signal but checks for the existence and
+    permission to signal the target. Returns False if the process is gone or
+    if EPERM means the PID was recycled by a different user.
+    """
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # PID exists but we can't signal it — likely recycled to a different
+        # user. Treat as dead so we don't keep watching a stale PID.
+        return False
+
+
+def _start_parent_death_watcher(
+    watch_pid: int | None = None, poll_interval: float = 0.5
+) -> None:
+    """Spawn a daemon thread that exits the process when a watched PID dies.
+
+    Tauri's macOS Cmd+Q can terminate the parent before its cleanup handlers
+    dispatch SIGKILL to sidecars (gptme/gptme#2260). When that happens, the
+    kernel reparents the orphan to PID 1 (launchd). We detect parent death and
+    self-terminate via SIGTERM so server shutdown still runs.
+
+    If `watch_pid` is given, we watch that specific PID (e.g. the Tauri grand-
+    parent PID, which is needed for PyInstaller-bundled servers because the
+    PyInstaller bootloader survives parent death and stays our `getppid()`).
+    Otherwise we watch our direct parent.
+    """
+    if watch_pid is None:
+        watch_pid = os.getppid()
+    if watch_pid <= 1:
+        # PID 0/1 means we're already orphaned or run directly under init —
+        # there's nothing meaningful to watch.
+        return
+
+    initial_pid = watch_pid
+
+    def _watcher() -> None:
+        while True:
+            time.sleep(poll_interval)
+            if not _pid_alive(initial_pid):
+                logger.warning(
+                    "Watched PID %d is gone, shutting down gptme-server",
+                    initial_pid,
+                )
+                # Send SIGTERM to ourselves so Flask's signal handlers run and
+                # the `finally: shutdown_telemetry()` block fires.
+                os.kill(os.getpid(), signal.SIGTERM)
+                return
+
+    thread = threading.Thread(target=_watcher, name="parent-death-watcher", daemon=True)
+    thread.start()
+
+
+def _install_sigterm_handler() -> None:
+    """Upgrade the startup SIGTERM handler to use the logger.
+
+    Called from ``serve()`` right after ``init_logging()`` so the handler can
+    emit a structured log line rather than writing directly to stderr.  The
+    module-level ``_startup_sigterm_handler`` already handles any SIGTERM that
+    arrives during the import phase (before this upgrade runs).
+
+    Both handlers re-raise SIGTERM as ``KeyboardInterrupt``, routing it through
+    Werkzeug's clean-shutdown path so the ``finally: shutdown_telemetry()``
+    block runs on ``systemctl stop``, container scale-down, or rolling restarts
+    (gptme/gptme#3589).
+
+    Signal handlers can only be installed from the main thread; this is called
+    from the ``serve`` command, which runs there.
+
+    Only upgrades our own startup handler, the OS default (SIG_DFL), or an
+    inherited SIG_IGN.  A *callable* handler installed by an embedder before
+    calling ``serve()`` is left intact (gptme/gptme#3597).  SIG_IGN is treated
+    like SIG_DFL because it can be inherited from a parent process (daemon
+    supervisor, test runner) and does not indicate a deliberate embedder choice
+    — refusing to upgrade it would silently disable graceful shutdown for servers
+    started under such supervisors.
+    """
+    current = signal.getsignal(signal.SIGTERM)
+    if callable(current) and current is not _startup_sigterm_handler:
+        # An embedder installed a custom callable handler; don't override it.
+        return
+
+    def _handle_sigterm(signum, frame):
+        global _sigterm_received
+        if _sigterm_received:
+            return
+        _sigterm_received = True
+        # os.write() is POSIX async-signal-safe: it bypasses Python's
+        # BufferedWriter, which raises RuntimeError on reentrant calls
+        # (gptme/gptme#3589).  logger.info() is NOT safe in signal handlers
+        # (acquires locks, uses buffered I/O) so we omit it here.
+        os.write(2, b"Received SIGTERM, shutting down gracefully\n")
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+
+@click.group(cls=DefaultGroup, default="serve", default_if_no_args=True)
+def main():
+    """gptme server commands."""
+    # if flask not installed, ask the user to install `server` extras
+    try:
+        __import__("flask")
+    except ImportError:
+        logger.error(
+            "gptme installed without needed extras for server. "
+            "Install them with `pip install gptme[server]`"
+        )
+        exit(1)
+
+
+@main.command("serve")
+@click.option("--debug", is_flag=True, help="Debug mode")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+@click.option(
+    "--model",
+    default=None,
+    help="Model to use by default, can be overridden in each request.",
+)
+@click.option(
+    "--host",
+    default="127.0.0.1",
+    envvar="GPTME_SERVER_HOST",
+    help="Host to bind the server to.",
+)
+@click.option(
+    "--port",
+    default=5700,
+    type=int,
+    envvar="GPTME_SERVER_PORT",
+    help="Port to run the server on.",
+)
+@click.option(
+    "--tools",
+    default=None,
+    help="Tools to enable (comma separated). Use 'none' to disable all tools.",
+)
+@click.option(
+    "--cors-origin",
+    default=None,
+    help=(
+        "CORS origin(s) to allow. Use '*' to allow all origins. Pass a "
+        "comma-separated list to allow multiple origins, e.g. "
+        "'https://chat.gptme.org,tauri://localhost,http://tauri.localhost'. "
+        "Set this to the origin of the web UI you load (for the hosted UI, "
+        "'https://chat.gptme.org')."
+    ),
+)
+@click.option(
+    "--allowed-hosts",
+    default=None,
+    envvar="GPTME_SERVER_ALLOWED_HOSTS",
+    help=(
+        "Comma-separated hostnames to accept in the Host header, in addition "
+        "to the built-in localhost/127.0.0.1/[::1] allow-list. Relevant when "
+        "bearer auth is explicitly disabled with GPTME_DISABLE_AUTH. Can also "
+        "be set via the GPTME_SERVER_ALLOWED_HOSTS environment variable."
+    ),
+)
+@click.option(
+    "--webui-dir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    default=None,
+    envvar="GPTME_WEBUI_DIR",
+    help=(
+        "Directory containing a web UI build to serve instead of the bundled "
+        "modern UI. Can also be set via the GPTME_WEBUI_DIR environment variable."
+    ),
+)
+@click.option(
+    "--exit-on-parent-death",
+    is_flag=True,
+    default=False,
+    help=(
+        "Exit when the parent process dies. Useful when run as a sidecar "
+        "(e.g. by gptme-tauri) to avoid orphaned servers when the parent "
+        "exits without cleaning up children (gptme/gptme#2260)."
+    ),
+)
+@click.option(
+    "--watch-pid",
+    type=int,
+    default=None,
+    help=(
+        "PID to watch for liveness. If the PID disappears the server exits. "
+        "Used by gptme-tauri to pass its own PID so PyInstaller-bundled servers "
+        "can detect Tauri exit even when the bootloader survives reparenting."
+    ),
+)
+@click.option(
+    "--default-profile",
+    default=None,
+    envvar="GPTME_SERVER_DEFAULT_PROFILE",
+    help=(
+        "Default agent profile to apply to new conversations that don't specify "
+        "a system prompt. Useful for specialized deployments such as the "
+        "computer-use Docker container where every session should use the "
+        "'computer-use' backend-selection policy. "
+        "Must be a valid profile name (e.g. 'computer-use', 'browser-use'). "
+        "Can also be set via the GPTME_SERVER_DEFAULT_PROFILE environment variable."
+    ),
+)
+def serve(
+    debug: bool,
+    verbose: bool,
+    model: str | None,
+    host: str,
+    port: int,
+    tools: str | None,
+    cors_origin: str | None,
+    allowed_hosts: str | None,
+    webui_dir: Path | None,
+    exit_on_parent_death: bool,
+    watch_pid: int | None,
+    default_profile: str | None,
+):  # pragma: no cover
+    """Starts a server and web UI for gptme."""
+    init_logging(verbose, compact=False)
+    # Upgrade the module-level startup SIGTERM handler (stderr-only) to the
+    # logger-aware version now that init_logging() has run.
+    _install_sigterm_handler()
+    set_config_from_workspace(Path.cwd())
+
+    if exit_on_parent_death or watch_pid is not None:
+        _start_parent_death_watcher(watch_pid=watch_pid)
+
+    # Try to initialize with provided/configured model
+    # If init fails due to missing model/API keys, use fallback
+    try:
+        init(
+            model,
+            interactive=False,
+            tool_allowlist=_parse_tools_allowlist(tools),
+            tool_format="markdown",
+            server=True,
+        )
+    except (ValueError, KeyError) as e:
+        error_msg = str(e)
+        is_config_error = (
+            "No API key found" in error_msg
+            or "No provider configured" in error_msg
+            or "No model specified" in error_msg
+            or "not set in env or config" in error_msg
+        )
+
+        if not is_config_error:
+            raise
+
+        # Handle model configuration errors with fallback.
+        # Pick a fallback that matches an available provider so we don't try
+        # (and fail) to use Anthropic when the user only has e.g. OpenAI keys.
+        fallback_model = _pick_fallback_model()
+        logger.warning(
+            f"No default model configured. Using fallback: {fallback_model}. "
+            "Set MODEL environment variable or use --model flag for explicit configuration."
+        )
+        # require_llm=False: if the fallback provider also has no API key
+        # (e.g. first-run Tauri with no keys configured), start the server
+        # in degraded mode so the user can configure a provider via the UI.
+        init(
+            fallback_model,
+            interactive=False,
+            tool_allowlist=_parse_tools_allowlist(tools),
+            tool_format="markdown",
+            server=True,
+            require_llm=False,
+        )
+
+    # Initialize telemetry (server is API/WebUI driven, not CLI interactive)
+    init_telemetry(
+        service_name="gptme-server",
+        enable_flask_instrumentation=True,
+        interactive=None,
+    )
+
+    click.echo("Initialization complete, starting server")
+
+    # Initialize authentication and display token
+    token = init_auth(host=host, display=True)
+    if token:
+        # Fragment (not query) so the token is not sent to the server or logged
+        # as a request URL. The bundled UI reads #userToken= and then strips it.
+        # Echo (not logger) so the URL is copyable on one line.
+        display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+        # IPv6 literals need square brackets in URLs (e.g. ::1 → [::1])
+        if ":" in display_host:
+            display_host = f"[{display_host}]"
+        click.echo(
+            f"Open the UI: http://{display_host}:{port}/#userToken={urlquote(token, safe='')}"
+        )
+
+    app = create_app(
+        cors_origin=cors_origin,
+        host=host,
+        webui_dir=webui_dir,
+        default_profile=default_profile,
+        allowed_hosts=[h.strip() for h in allowed_hosts.split(",") if h.strip()]
+        if allowed_hosts
+        else None,
+    )
+
+    try:
+        app.run(debug=debug, host=host, port=port)
+    finally:
+        shutdown_telemetry()
+
+
+@main.command("token")
+def show_token():
+    """Display the server authentication token."""
+    token = get_server_token()
+    if token:
+        click.echo("=" * 60)
+        click.echo("gptme-server Authentication Token")
+        click.echo("=" * 60)
+        click.echo(f"Token: {token}")
+        click.echo("")
+        click.echo("Use this token in the Authorization header:")
+        click.echo(f"  Authorization: Bearer {token}")
+        click.echo("=" * 60)
+    else:
+        click.echo("=" * 60)
+        click.echo("gptme-server Authentication")
+        click.echo("=" * 60)
+        click.echo("Authentication is DISABLED (no token configured)")
+        click.echo("")
+        click.echo(
+            "To enable authentication, set the GPTME_SERVER_TOKEN environment variable:"
+        )
+        click.echo("  GPTME_SERVER_TOKEN=your-secret-token gptme-server serve")
+        click.echo("=" * 60)
+
+
+@main.command("openapi")
+@click.option("-o", "--output", default="openapi.json", help="Output file path")
+def generate_openapi(output: str):
+    """Generate OpenAPI specification without starting server."""
+    app = create_app()
+    with app.app_context():
+        from .openapi_docs import generate_openapi_spec
+
+        spec = generate_openapi_spec()
+
+        with open(output, "w") as f:
+            json.dump(spec, f, indent=2)
+
+        click.echo(f"OpenAPI specification generated: {output}")
+
+
+if __name__ == "__main__":
+    main()

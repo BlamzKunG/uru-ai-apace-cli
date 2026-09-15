@@ -1,0 +1,762 @@
+import json
+from collections.abc import Iterator
+from typing import Any
+from unittest.mock import patch
+from uuid import UUID
+
+import pytest
+import requests
+
+from gptme.hooks.server_confirm import current_conversation_id
+from gptme.llm import llm_openai_subscription
+from gptme.llm.llm_openai_subscription import SubscriptionAuth
+from gptme.message import Message
+from gptme.telemetry import clear_conversation_context, set_conversation_context
+from gptme.tools import get_tool, init_tools
+
+
+def _make_auth() -> SubscriptionAuth:
+    return SubscriptionAuth(
+        access_token="test-token",
+        refresh_token=None,
+        account_id="test-account",
+        expires_at=9_999_999_999.0,
+    )
+
+
+class _FakeSSEStreamResponse:
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        self.status_code = 200
+        self.text = ""
+        self._events = events
+        self.closed = False
+
+    def iter_lines(self) -> Iterator[bytes]:
+        for event in self._events:
+            yield f"data: {json.dumps(event)}".encode()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _run_stream(events: list[dict[str, Any]]) -> str:
+    auth = _make_auth()
+    response = _FakeSSEStreamResponse(events)
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch("gptme.llm.llm_openai_subscription.requests.post", return_value=response),
+    ):
+        return "".join(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.4"
+            )
+        )
+
+
+def test_stream_wraps_reasoning_and_closes_before_text():
+    output = _run_stream(
+        [
+            {"type": "response.reasoning.delta", "delta": "Need a command"},
+            {"type": "response.output_text.delta", "delta": "Done."},
+            {"type": "response.done"},
+        ]
+    )
+
+    assert output == "<think>\nNeed a command\n</think>\nDone."
+
+
+def test_stream_converts_split_thinking_tags_across_chunks():
+    output = _run_stream(
+        [
+            {"type": "response.output_text.delta", "delta": "Before <thi"},
+            {"type": "response.output_text.delta", "delta": "nking>reason"},
+            {"type": "response.output_text.delta", "delta": "ing</think"},
+            {"type": "response.output_text.delta", "delta": "ing> after"},
+            {"type": "response.done"},
+        ]
+    )
+
+    assert output == "Before <think>reasoning</think> after"
+
+
+def test_stream_ignores_output_text_done_to_avoid_duplicate_text():
+    output = _run_stream(
+        [
+            {"type": "response.output_text.delta", "delta": "Hello"},
+            {"type": "response.output_text.done", "text": "Hello"},
+            {"type": "response.done"},
+        ]
+    )
+
+    assert output == "Hello"
+
+
+def test_stream_closes_reasoning_before_function_call_output():
+    output = _run_stream(
+        [
+            {"type": "response.reasoning.delta", "delta": "Need save"},
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "name": "save",
+                    "call_id": "call_1",
+                },
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "delta": '{"path":"x.txt"}',
+            },
+            {"type": "response.done"},
+        ]
+    )
+
+    assert output == '<think>\nNeed save\n</think>\n\n@save(call_1): {"path":"x.txt"}'
+
+
+def test_stream_no_double_wrap_when_both_mechanisms_fire():
+    """Regression: gpt-5.4 can emit BOTH response.reasoning.delta AND raw <thinking>
+    tags in output_text.delta for the same content. Without the fix this produces
+    nested <think><think>...</think></think> double-wrapping.
+    """
+    output = _run_stream(
+        [
+            # Structured reasoning events — open the <think> block
+            {"type": "response.reasoning.delta", "delta": "Need a command"},
+            # Model ALSO echoes reasoning as raw <thinking> in text output (gpt-5.4 bug).
+            # The text conversion must be skipped to avoid double-wrapping.
+            {
+                "type": "response.output_text.delta",
+                "delta": "<thinking>Need a command</thinking>",
+            },
+            {"type": "response.output_text.delta", "delta": "Done."},
+            {"type": "response.done"},
+        ]
+    )
+
+    assert output == "<think>\nNeed a command\n</think>\nDone."
+
+
+def test_stream_builds_shared_responses_request_shape():
+    response = _FakeSSEStreamResponse([{"type": "response.done"}])
+    init_tools(allowlist=["save"])
+    save_tool = get_tool("save")
+    assert save_tool is not None
+
+    messages = [
+        Message(role="system", content="You are concise."),
+        Message(role="user", content="Save a note."),
+        Message(
+            role="assistant",
+            content='Saving now.\n@save(call_123): {"path": "note.txt", "content": "hi"}',
+        ),
+        Message(role="system", content="Saved to note.txt", call_id="call_123"),
+    ]
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=_make_auth()),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post", return_value=response
+        ) as mock_post,
+    ):
+        list(llm_openai_subscription.stream(messages, "gpt-5.4", tools=[save_tool]))
+
+    request_json = mock_post.call_args.kwargs["json"]
+    assert request_json["instructions"] == "You are concise."
+    assert request_json["input"] == [
+        {"role": "user", "content": "Save a note."},
+        {"role": "assistant", "content": "Saving now."},
+        {
+            "type": "function_call",
+            "call_id": "call_123",
+            "name": "save",
+            "arguments": '{"path": "note.txt", "content": "hi"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_123",
+            "output": "Saved to note.txt",
+        },
+    ]
+    assert request_json["tools"][0]["type"] == "function"
+    assert request_json["tools"][0]["name"] == "save"
+
+
+def test_stream_preserves_both_call_ids_for_multi_tool_assistant_turn():
+    """Regression: _merge_consecutive_messages was merging adjacent tool-result
+    system messages, dropping the second call_id.  When an assistant turn
+    contains two tool calls (call_A, call_B), two system messages are produced
+    in sequence.  prune_ephemeral_messages → _merge_consecutive_messages must
+    NOT merge them, so both function_call_output items survive in the Codex
+    Responses API input.  Without the fix the API returns 400:
+    "No tool output found for function call call_B"."""
+    response = _FakeSSEStreamResponse([{"type": "response.done"}])
+    init_tools(allowlist=["save"])
+    save_tool = get_tool("save")
+    assert save_tool is not None
+
+    messages = [
+        Message(role="system", content="You are concise."),
+        Message(role="user", content="Save two files."),
+        Message(
+            role="assistant",
+            content=(
+                '@save(call_A): {"path": "a.txt", "content": "a"}\n'
+                '@save(call_B): {"path": "b.txt", "content": "b"}'
+            ),
+        ),
+        Message(role="system", content="Saved a.txt", call_id="call_A"),
+        Message(role="system", content="Saved b.txt", call_id="call_B"),
+    ]
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=_make_auth()),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post", return_value=response
+        ) as mock_post,
+    ):
+        list(llm_openai_subscription.stream(messages, "gpt-5.4", tools=[save_tool]))
+
+    request_json = mock_post.call_args.kwargs["json"]
+    input_items = request_json["input"]
+
+    fc_outputs = [it for it in input_items if it.get("type") == "function_call_output"]
+    assert len(fc_outputs) == 2, (
+        f"Expected 2 function_call_output items, got {len(fc_outputs)}: {fc_outputs}"
+    )
+    output_call_ids = {it["call_id"] for it in fc_outputs}
+    assert output_call_ids == {"call_A", "call_B"}, (
+        f"Expected both call_ids to be present; got {output_call_ids}"
+    )
+
+
+def test_stream_forwards_max_tokens_as_max_output_tokens():
+    """max_tokens passed to stream() must appear as max_output_tokens in the POST body."""
+    response = _FakeSSEStreamResponse([{"type": "response.done"}])
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=_make_auth()),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post", return_value=response
+        ) as mock_post,
+    ):
+        list(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")],
+                "gpt-5.4",
+                max_tokens=1000,
+            )
+        )
+
+    request_json = mock_post.call_args.kwargs["json"]
+    assert request_json["max_output_tokens"] == 1000
+
+
+def test_stream_omits_max_output_tokens_when_not_provided():
+    """When max_tokens is not given, max_output_tokens must not appear in the POST body."""
+    response = _FakeSSEStreamResponse([{"type": "response.done"}])
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=_make_auth()),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post", return_value=response
+        ) as mock_post,
+    ):
+        list(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.4"
+            )
+        )
+
+    request_json = mock_post.call_args.kwargs["json"]
+    assert "max_output_tokens" not in request_json
+
+
+def test_stream_uses_generous_read_timeout_for_reasoning_models(monkeypatch):
+    """The read timeout applies BETWEEN stream chunks; reasoning-heavy models
+    (gpt-5.5 high, gpt-5.6-sol) can think for minutes without emitting an
+    event, and the old flat timeout=120 killed sessions mid-run after they
+    had already completed real work."""
+    auth = _make_auth()
+    response = _FakeSSEStreamResponse([{"type": "response.done"}])
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post",
+            return_value=response,
+        ) as mock_post,
+    ):
+        list(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.6-sol"
+            )
+        )
+
+    timeout = mock_post.call_args.kwargs["timeout"]
+    assert timeout == (30, 600.0)
+
+
+def test_stream_read_timeout_env_override(monkeypatch):
+    monkeypatch.setenv("GPTME_SUBSCRIPTION_READ_TIMEOUT", "90")
+    auth = _make_auth()
+    response = _FakeSSEStreamResponse([{"type": "response.done"}])
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post",
+            return_value=response,
+        ) as mock_post,
+    ):
+        list(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.6-sol"
+            )
+        )
+
+    assert mock_post.call_args.kwargs["timeout"] == (30, 90.0)
+
+
+@pytest.mark.parametrize("bad_val", ["", "abc", "0", "-1", "inf", "nan"])
+def test_stream_read_timeout_invalid_env_falls_back_to_default(monkeypatch, bad_val):
+    """Invalid or non-positive GPTME_SUBSCRIPTION_READ_TIMEOUT must fall back to 600s
+    rather than raising or passing a bad value to requests."""
+    if bad_val == "":
+        monkeypatch.delenv("GPTME_SUBSCRIPTION_READ_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("GPTME_SUBSCRIPTION_READ_TIMEOUT", bad_val)
+    auth = _make_auth()
+    response = _FakeSSEStreamResponse([{"type": "response.done"}])
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post",
+            return_value=response,
+        ) as mock_post,
+    ):
+        list(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.6-sol"
+            )
+        )
+
+    assert mock_post.call_args.kwargs["timeout"] == (30, 600.0)
+
+
+class _TimeoutThenEventsResponse:
+    """First iter_lines() call raises ReadTimeout (silent reasoning pause
+    exceeding the read timeout); used to simulate a retryable idle stream."""
+
+    def __init__(self) -> None:
+        self.status_code = 200
+        self.text = ""
+        self.closed = False
+
+    def iter_lines(self) -> Iterator[bytes]:
+        raise requests.exceptions.ReadTimeout("read timeout=600")
+        yield b""  # pragma: no cover — makes this a generator
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _EventThenTimeoutResponse:
+    """Emits one event, then times out — retrying here would duplicate output."""
+
+    def __init__(self) -> None:
+        self.status_code = 200
+        self.text = ""
+        self.closed = False
+
+    def iter_lines(self) -> Iterator[bytes]:
+        yield f"data: {json.dumps({'type': 'response.output_text.delta', 'delta': 'partial'})}".encode()
+        raise requests.exceptions.ReadTimeout("read timeout=600")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_stream_retries_idle_timeout_before_first_event():
+    """A read timeout during the thinking phase (no events yielded yet) retries
+    the request instead of dying — mirrors codex-rs stream_max_retries."""
+    auth = _make_auth()
+    ok = _FakeSSEStreamResponse(
+        [
+            {"type": "response.output_text.delta", "delta": "Done."},
+            {"type": "response.done"},
+        ]
+    )
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post",
+            side_effect=[_TimeoutThenEventsResponse(), ok],
+        ) as mock_post,
+    ):
+        output = "".join(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.6-sol"
+            )
+        )
+
+    assert output == "Done."
+    assert mock_post.call_count == 2
+
+
+def test_stream_does_not_retry_after_first_event():
+    """After partial output a re-POST would duplicate content — re-raise."""
+    auth = _make_auth()
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post",
+            return_value=_EventThenTimeoutResponse(),
+        ) as mock_post,
+        pytest.raises(requests.exceptions.ReadTimeout),
+    ):
+        list(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.6-sol"
+            )
+        )
+
+    assert mock_post.call_count == 1
+
+
+def test_stream_retries_exhausted_reraises(monkeypatch):
+    monkeypatch.setenv("GPTME_SUBSCRIPTION_STREAM_RETRIES", "2")
+    auth = _make_auth()
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post",
+            side_effect=[
+                _TimeoutThenEventsResponse(),
+                _TimeoutThenEventsResponse(),
+                _TimeoutThenEventsResponse(),
+            ],
+        ) as mock_post,
+        pytest.raises(requests.exceptions.ReadTimeout),
+    ):
+        list(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.6-sol"
+            )
+        )
+
+    assert mock_post.call_count == 3  # initial + 2 retries
+
+
+class _Non200Response:
+    def __init__(self, status_code: int, body: str) -> None:
+        self.status_code = status_code
+        self.text = body
+        self.closed = False
+
+    def iter_lines(self) -> Iterator[bytes]:
+        raise AssertionError("iter_lines should not run on a non-200 response")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_stream_non_200_raises_http_error():
+    """A Codex 429 must surface as requests.HTTPError, not ValueError.
+
+    Interactive recovery matches provider errors by defining module
+    (openai/anthropic/httpx/requests). Raising ValueError hid subscription
+    rate-limits from that path. See gptme/gptme#3668 / AI-review P1 e7ff9bb47622.
+    """
+    auth = _make_auth()
+    resp = _Non200Response(429, "usage_limit_reached")
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch("gptme.llm.llm_openai_subscription.requests.post", return_value=resp),
+        pytest.raises(requests.HTTPError, match="Codex API error 429") as ei,
+    ):
+        list(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.6-sol"
+            )
+        )
+
+    assert ei.value.response is resp
+    assert resp.closed
+
+
+def _drain_stream(events: list[dict[str, Any]]) -> tuple[str, Any]:
+    """Drain the stream generator, returning (content, return_value)."""
+    auth = _make_auth()
+    response = _FakeSSEStreamResponse(events)
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch("gptme.llm.llm_openai_subscription.requests.post", return_value=response),
+    ):
+        gen = llm_openai_subscription.stream(
+            [Message(role="user", content="hello")], "gpt-5.4"
+        )
+        parts = []
+        ret: Any = None
+        try:
+            while True:
+                parts.append(next(gen))
+        except StopIteration as e:
+            ret = e.value
+        return "".join(parts), ret
+
+
+def test_stream_returns_usage_from_response_done():
+    """response.done with usage dict must be returned as metadata by stream()."""
+    content, metadata = _drain_stream(
+        [
+            {"type": "response.output_text.delta", "delta": "Hello."},
+            {
+                "type": "response.done",
+                "response": {
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "total_tokens": 150,
+                    }
+                },
+            },
+        ]
+    )
+
+    assert content == "Hello."
+    assert metadata is not None
+    assert metadata.get("usage", {}).get("input_tokens") == 100
+    assert metadata.get("usage", {}).get("output_tokens") == 50
+
+
+def test_stream_records_effort_when_response_done_has_no_usage():
+    """response.done without usage still records the explicit Codex effort."""
+    _, metadata = _drain_stream([{"type": "response.done"}])
+    assert metadata == {"reasoning_effort": "medium"}
+
+
+def test_stream_records_effort_when_usage_has_no_counts():
+    """Empty usage object is treated as no usage, but effort stays on the record."""
+    _, metadata = _drain_stream([{"type": "response.done", "response": {"usage": {}}}])
+    assert metadata == {"reasoning_effort": "medium"}
+
+
+def test_stream_captures_usage_without_cache_fields():
+    """Subscription responses don't have cache token fields; must not crash."""
+    _, metadata = _drain_stream(
+        [
+            {
+                "type": "response.done",
+                "response": {
+                    "usage": {
+                        "input_tokens": 200,
+                        "output_tokens": 75,
+                    }
+                },
+            }
+        ]
+    )
+    assert metadata is not None
+    usage = metadata.get("usage", {})
+    assert usage.get("input_tokens") == 200
+    assert usage.get("output_tokens") == 75
+    assert "cache_read_tokens" not in usage
+    assert "cache_creation_tokens" not in usage
+
+
+def test_stream_closes_response_after_done_event():
+    """response.close() must be called when the done event is received.
+
+    Regression test for SIGSEGV (status=139) on interpreter teardown: a
+    streaming requests.Response keeps its SSL socket open until explicitly
+    closed.  If we return from _sse_events() without calling close(), the
+    socket lingers in urllib3's pool and can SIGSEGV when _ssl is finalized
+    during Python shutdown before the pool is torn down.
+    """
+    auth = _make_auth()
+    response = _FakeSSEStreamResponse(
+        [
+            {"type": "response.output_text.delta", "delta": "Hi."},
+            {"type": "response.done"},
+        ]
+    )
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch("gptme.llm.llm_openai_subscription.requests.post", return_value=response),
+    ):
+        list(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.4"
+            )
+        )
+
+    assert response.closed, "response.close() must be called after the done event"
+
+
+def test_stream_closes_response_on_retry():
+    """The old response must be closed before opening the retry request.
+
+    Without this, the abandoned SSL socket lingers until interpreter teardown,
+    which can SIGSEGV when _ssl is finalized before urllib3 pools are GC'd.
+    """
+    auth = _make_auth()
+    timed_out = _TimeoutThenEventsResponse()
+    ok = _FakeSSEStreamResponse(
+        [
+            {"type": "response.output_text.delta", "delta": "Done."},
+            {"type": "response.done"},
+        ]
+    )
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post",
+            side_effect=[timed_out, ok],
+        ),
+    ):
+        list(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.6-sol"
+            )
+        )
+
+    assert timed_out.closed, "timed-out response must be closed before retry"
+    assert ok.closed, "final response must be closed after done event"
+
+
+def _stream_session_ids(n: int, model: str = "gpt-5.4") -> list[str]:
+    responses = [_FakeSSEStreamResponse([{"type": "response.done"}]) for _ in range(n)]
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=_make_auth()),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post",
+            side_effect=responses,
+        ) as mock_post,
+    ):
+        for _ in range(n):
+            list(
+                llm_openai_subscription.stream(
+                    [Message(role="user", content="hello")], model
+                )
+            )
+    return [call.kwargs["headers"]["session_id"] for call in mock_post.call_args_list]
+
+
+def test_codex_session_id_stable_within_conversation_and_differs_across():
+    """Same conversation + model must reuse session_id; another conversation must not.
+
+    OnlyTerp gotcha 9b: a per-request UUID as Codex session_id is a pod-routing
+    hint and forces cold-cache pricing. Two stream() calls in one conversation
+    have to send the same header.
+    """
+    token = current_conversation_id.set("conv-stable-a")
+    try:
+        first, second = _stream_session_ids(2, "gpt-5.4")
+    finally:
+        current_conversation_id.reset(token)
+
+    assert first == second
+    UUID(first)
+
+    token = current_conversation_id.set("conv-stable-b")
+    try:
+        (other,) = _stream_session_ids(1, "gpt-5.4")
+    finally:
+        current_conversation_id.reset(token)
+
+    assert other != first
+
+
+def test_codex_session_id_differs_across_models_in_same_conversation():
+    token = current_conversation_id.set("conv-stable-a")
+    try:
+        (model_a,) = _stream_session_ids(1, "gpt-5.4")
+        (model_b,) = _stream_session_ids(1, "gpt-5.6-sol")
+    finally:
+        current_conversation_id.reset(token)
+
+    assert model_a != model_b
+
+
+def test_codex_session_id_same_for_equivalent_default_and_explicit_medium():
+    """Default effort and explicit :medium are the same Codex request.
+
+    Hashing the raw model spelling would split cache affinity between
+    gpt-5.6-sol and gpt-5.6-sol:medium even though both become
+    (model=gpt-5.6-sol, effort=medium). :high must still differ.
+    """
+    token = current_conversation_id.set("conv-stable-a")
+    try:
+        default = llm_openai_subscription._codex_session_id("gpt-5.6-sol")
+        explicit_medium = llm_openai_subscription._codex_session_id(
+            "gpt-5.6-sol:medium"
+        )
+        high = llm_openai_subscription._codex_session_id("gpt-5.6-sol:high")
+    finally:
+        current_conversation_id.reset(token)
+
+    assert default == explicit_medium
+    assert default != high
+    UUID(default)
+
+
+def test_codex_session_id_uses_telemetry_conversation_when_server_unset():
+    set_conversation_context(conversation_id="cli-logdir-name")
+    try:
+        a = llm_openai_subscription._codex_session_id("gpt-5.4")
+        b = llm_openai_subscription._codex_session_id("gpt-5.4")
+    finally:
+        clear_conversation_context()
+
+    assert a == b
+    UUID(a)
+
+
+def test_codex_session_id_prefers_server_context_over_telemetry():
+    set_conversation_context(conversation_id="cli-logdir-name")
+    token = current_conversation_id.set("server-conv")
+    try:
+        server = llm_openai_subscription._codex_session_id("gpt-5.4")
+    finally:
+        current_conversation_id.reset(token)
+        clear_conversation_context()
+
+    set_conversation_context(conversation_id="cli-logdir-name")
+    try:
+        cli = llm_openai_subscription._codex_session_id("gpt-5.4")
+    finally:
+        clear_conversation_context()
+
+    assert server != cli
+
+
+def test_stream_records_reasoning_tokens_and_effort():
+    """Codex usage carries output_tokens_details.reasoning_tokens; effort is always explicit."""
+    _, metadata = _drain_stream(
+        [
+            {
+                "type": "response.done",
+                "response": {
+                    "usage": {
+                        "input_tokens": 200,
+                        "output_tokens": 75,
+                        "output_tokens_details": {"reasoning_tokens": 60},
+                    }
+                },
+            }
+        ]
+    )
+    assert metadata is not None
+    assert metadata["usage"]["reasoning_tokens"] == 60
+    # _drain_stream uses bare "gpt-5.4" → default Codex effort
+    assert metadata["reasoning_effort"] == "medium"

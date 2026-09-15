@@ -1,0 +1,38 @@
+import '@testing-library/jest-dom';
+import { TextDecoder, TextEncoder } from 'util';
+
+// react-dom/server.browser expects browser text encoding globals. jsdom does not
+// expose them in Jest, while real browsers and Node do.
+if (typeof globalThis.TextEncoder === 'undefined') {
+  globalThis.TextEncoder = TextEncoder;
+}
+if (typeof globalThis.TextDecoder === 'undefined') {
+  globalThis.TextDecoder = TextDecoder as typeof globalThis.TextDecoder;
+}
+
+// Polyfill structuredClone for jsdom — Node 17+ has it but jsdom doesn't expose it.
+// Limitation: JSON.parse/JSON.stringify drops undefined properties, coerces Date to
+// string, throws on BigInt, and silently converts Map/Set to {}. Safe for the current
+// JSON-compatible conversation objects; revisit if tests start using those types.
+if (typeof structuredClone === 'undefined') {
+  global.structuredClone = <T>(val: T): T => JSON.parse(JSON.stringify(val));
+}
+
+// Polyfill URL.createObjectURL/revokeObjectURL for jsdom — it doesn't implement
+// the Blob URL API, but components that preview blobs (e.g. FilePreview) call
+// revokeObjectURL in cleanup effects.
+if (typeof URL.createObjectURL === 'undefined') {
+  URL.createObjectURL = jest.fn(() => 'blob:mock-url');
+}
+if (typeof URL.revokeObjectURL === 'undefined') {
+  URL.revokeObjectURL = jest.fn();
+}
+
+// Shim Vite import.meta.env for Jest.
+// connectionConfig.ts reads named VITE_* vars via Function() + process.env
+// fallback (Jest cannot parse import.meta). The DEV flag lives in viteEnv.ts
+// and is remapped to src/utils/__mocks__/viteEnv.ts by jest.config.ts.
+// Keep these in sync with the hardcoded defaults in connectionConfig.ts.
+process.env.VITE_GPTME_CLOUD_BASE_URL = 'https://gptme.ai';
+process.env.VITE_GPTME_FLEET_BASE_URL = 'https://fleet.gptme.ai';
+process.env.VITE_GPTME_API_URL = 'http://127.0.0.1:5700';

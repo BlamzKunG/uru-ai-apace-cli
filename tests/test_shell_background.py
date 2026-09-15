@@ -1,0 +1,1103 @@
+"""Tests for gptme/tools/shell_background.py — background job management.
+
+Covers:
+- BackgroundJob dataclass (buffer mgmt, lifecycle, thread-safe output)
+- Module-level job registry (start, get, list, cleanup, reset)
+- Command handlers (bg, jobs, output, kill)
+"""
+
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from threading import Thread
+from unittest.mock import Mock, patch
+
+import pytest
+
+from gptme.tools.shell_background import (
+    _MAX_BUFFER_SIZE,
+    BackgroundJob,
+    _wait_readable,
+    cleanup_finished_jobs,
+    execute_bg_command,
+    execute_jobs_command,
+    execute_kill_command,
+    execute_output_command,
+    get_background_job,
+    list_background_jobs,
+    reset_background_jobs,
+    start_background_job,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_jobs():
+    """Reset global job state before and after each test."""
+    reset_background_jobs()
+    yield
+    reset_background_jobs()
+
+
+# ---------------------------------------------------------------------------
+# BackgroundJob dataclass — buffer management
+# ---------------------------------------------------------------------------
+
+
+class TestAppendToBuffer:
+    """Test _append_to_buffer overflow protection."""
+
+    def test_append_small(self):
+        job = _make_job()
+        job._append_to_buffer(job.stdout_buffer, "hello")
+        assert job.stdout_buffer == ["hello"]
+
+    def test_append_multiple(self):
+        job = _make_job()
+        job._append_to_buffer(job.stdout_buffer, "a")
+        job._append_to_buffer(job.stdout_buffer, "b")
+        assert job.stdout_buffer == ["a", "b"]
+
+    def test_overflow_truncates_from_front(self):
+        """When buffer exceeds _MAX_BUFFER_SIZE, oldest entries are dropped."""
+        job = _make_job()
+        # Fill with chunks that total exactly _MAX_BUFFER_SIZE
+        chunk = "x" * (_MAX_BUFFER_SIZE // 2)
+        job._append_to_buffer(job.stdout_buffer, chunk)
+        job._append_to_buffer(job.stdout_buffer, chunk)
+        # Buffer at limit — next append should evict the oldest
+        job._append_to_buffer(job.stdout_buffer, "overflow")
+        total = sum(len(s) for s in job.stdout_buffer)
+        assert total <= _MAX_BUFFER_SIZE + len("overflow")
+        # The first chunk should have been removed
+        assert job.stdout_buffer[0] == chunk  # second chunk kept
+        assert job.stdout_buffer[-1] == "overflow"
+        assert len(job.stdout_buffer) == 2
+
+    def test_single_entry_never_evicted(self):
+        """A single buffer entry should never be removed even if oversized."""
+        job = _make_job()
+        huge = "x" * (_MAX_BUFFER_SIZE + 100)
+        job._append_to_buffer(job.stdout_buffer, huge)
+        assert len(job.stdout_buffer) == 1
+        assert job.stdout_buffer[0] == huge
+
+
+# ---------------------------------------------------------------------------
+# BackgroundJob — get_output
+# ---------------------------------------------------------------------------
+
+
+class TestGetOutput:
+    def test_empty_output(self):
+        job = _make_job()
+        stdout, stderr = job.get_output()
+        assert stdout == ""
+        assert stderr == ""
+
+    def test_with_data(self):
+        job = _make_job()
+        job.stdout_buffer.extend(["hello ", "world"])
+        job.stderr_buffer.append("err")
+        stdout, stderr = job.get_output()
+        assert stdout == "hello world"
+        assert stderr == "err"
+
+
+# ---------------------------------------------------------------------------
+# BackgroundJob — lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestJobLifecycle:
+    def test_is_running_for_live_process(self):
+        job = start_background_job("sleep 60")
+        assert job.is_running()
+        job.kill()
+
+    def test_is_running_for_finished_process(self):
+        job = start_background_job("true")
+        job.process.wait(timeout=5)
+        # Allow reader thread to detect exit
+        time.sleep(0.3)
+        assert not job.is_running()
+
+    def test_elapsed_time_increases(self):
+        job = _make_job()
+        t1 = job.elapsed_time()
+        time.sleep(0.05)
+        t2 = job.elapsed_time()
+        assert t2 > t1
+
+    def test_kill_terminates_process(self):
+        job = start_background_job("sleep 60")
+        assert job.is_running()
+        job.kill()
+        assert not job.is_running()
+        assert job.process.returncode is not None
+
+    def test_kill_already_finished(self):
+        """A finished job must not signal a potentially reused process group."""
+        from unittest.mock import patch
+
+        job = start_background_job("true")
+        job.process.wait(timeout=5)
+        time.sleep(0.3)
+        with patch("gptme.tools.shell_background.os.killpg") as killpg:
+            job.kill()
+        killpg.assert_not_called()
+        assert not job.is_running()
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX process groups only")
+    def test_kill_uses_process_group_captured_at_start(self):
+        """Termination must not resolve a possibly reused leader PID."""
+        from unittest.mock import patch
+
+        job = start_background_job("sleep 60")
+        assert job.process_group_id == job.process.pid
+        try:
+            with (
+                patch("gptme.tools.shell_background.os.getpgid") as getpgid,
+                patch("gptme.tools.shell_background.os.killpg") as killpg,
+                patch.object(job.process, "wait", return_value=0),
+            ):
+                job.kill()
+            getpgid.assert_not_called()
+            killpg.assert_called_once_with(job.process_group_id, signal.SIGTERM)
+        finally:
+            job.process.kill()
+            job.process.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# BackgroundJob — output capture via reader thread
+# ---------------------------------------------------------------------------
+
+
+class TestOutputCapture:
+    def test_stdout_captured(self):
+        job = start_background_job("echo hello_stdout")
+        job.process.wait(timeout=5)
+        # Give reader thread time to flush
+        time.sleep(0.5)
+        stdout, _ = job.get_output()
+        assert "hello_stdout" in stdout
+
+    def test_stderr_captured(self):
+        job = start_background_job("echo hello_stderr >&2")
+        job.process.wait(timeout=5)
+        time.sleep(0.5)
+        _, stderr = job.get_output()
+        assert "hello_stderr" in stderr
+
+    def test_both_streams(self):
+        job = start_background_job("echo out1; echo err1 >&2")
+        job.process.wait(timeout=5)
+        time.sleep(0.5)
+        stdout, stderr = job.get_output()
+        assert "out1" in stdout
+        assert "err1" in stderr
+
+    def test_multiline_output(self):
+        job = start_background_job("seq 1 5")
+        job.process.wait(timeout=5)
+        time.sleep(0.5)
+        stdout, _ = job.get_output()
+        for n in range(1, 6):
+            assert str(n) in stdout
+
+    def test_large_output_buffered(self):
+        """Generate output near buffer limit to test overflow handling."""
+        # Generate ~100KB of output (well under 1MB limit)
+        job = start_background_job(f"{sys.executable} -c \"print('A' * 100_000)\"")
+        job.process.wait(timeout=10)
+        time.sleep(0.5)
+        stdout, _ = job.get_output()
+        assert len(stdout) >= 100_000
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX process groups only")
+    def test_descendant_holding_pipes_does_not_stall_completion(self):
+        """A detached descendant must not suppress the direct child's completion."""
+        from types import SimpleNamespace
+
+        from gptme.tools.shell_background import background_job_completion_hook
+
+        job = start_background_job("sleep 30 &")
+        try:
+            job.process.wait(timeout=5)
+            assert job._reader_thread is not None
+            job._reader_thread.join(timeout=3)
+            assert not job._reader_thread.is_alive()
+
+            messages = list(
+                background_job_completion_hook(
+                    SimpleNamespace(chat_id=job.conversation_id), True, []
+                )
+            )
+            assert len(messages) == 1
+            assert f"job #{job.id} finished" in messages[0].content
+        finally:
+            if job.process_group_id is not None:
+                try:
+                    os.killpg(job.process_group_id, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_stop_during_post_exit_grace_preserves_buffered_output(self):
+        """Teardown wakes the reader without dropping already readable bytes."""
+        job = start_background_job("sleep 30 &")
+        try:
+            job.process.wait(timeout=5)
+            assert job._reader_thread is not None
+            deadline = time.monotonic() + 2
+            while job.process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            job._stop_event.set()
+            job._reader_thread.join(timeout=1)
+            assert not job._reader_thread.is_alive()
+        finally:
+            if job.process_group_id is not None:
+                try:
+                    os.killpg(job.process_group_id, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_reader_does_not_use_select_select_while_running(self):
+        """Streaming capture must not go through select.select (#3715 leftover).
+
+        Pre-fix the POSIX reader called ``select.select`` and treated
+        ``ValueError: filedescriptor out of range in select()`` as a stop
+        condition, so output was only flushed in the final ``.read()`` after
+        the process exited. A live job would therefore look silent.
+        """
+        pytest.importorskip("fcntl", reason="POSIX-only path")
+
+        def boom(*args, **kwargs):
+            raise ValueError("filedescriptor out of range in select()")
+
+        with patch("gptme.tools.shell_background.select.select", boom):
+            job = start_background_job("echo bg-high-fd-safe; sleep 5")
+            stdout = ""
+            deadline = time.time() + 2.0
+            try:
+                while time.time() < deadline:
+                    stdout, _ = job.get_output()
+                    if "bg-high-fd-safe" in stdout:
+                        break
+                    time.sleep(0.05)
+                assert "bg-high-fd-safe" in stdout
+            finally:
+                job.kill()
+
+
+# ---------------------------------------------------------------------------
+# _wait_readable — poll() instead of select() (gptme/gptme#3715)
+# ---------------------------------------------------------------------------
+
+# Anything at or above FD_SETSIZE is unrepresentable in an fd_set.
+_FD_SETSIZE = 1024
+_FD_SCAN_WINDOW = 256
+
+
+def _find_free_fd(start: int) -> int:
+    """Return an unused descriptor >= `start` without clobbering a live fd."""
+    fcntl = pytest.importorskip("fcntl", reason="POSIX-only test")
+    for candidate in range(start, start + _FD_SCAN_WINDOW):
+        try:
+            fcntl.fcntl(candidate, fcntl.F_GETFD)
+        except OSError:
+            return candidate
+    pytest.skip(f"no free descriptor in [{start}, {start + _FD_SCAN_WINDOW})")
+
+
+class TestWaitReadable:
+    def test_empty_fds(self):
+        assert _wait_readable([], 0.01) == []
+
+    def test_reports_only_ready_fds(self):
+        pytest.importorskip("fcntl", reason="POSIX-only test")
+        idle_r, idle_w = os.pipe()
+        ready_r, ready_w = os.pipe()
+        try:
+            os.write(ready_w, b"x")
+            assert _wait_readable([idle_r, ready_r], 0.1) == [ready_r]
+        finally:
+            for fd in (idle_r, idle_w, ready_r, ready_w):
+                os.close(fd)
+
+    def test_times_out_with_no_data(self):
+        pytest.importorskip("fcntl", reason="POSIX-only test")
+        read_fd, write_fd = os.pipe()
+        try:
+            assert _wait_readable([read_fd], 0.05) == []
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_rounds_positive_submillisecond_timeout_up(self):
+        if not hasattr(__import__("select"), "poll"):
+            pytest.skip("select.poll is POSIX-only")
+        poller = Mock()
+        poller.poll.return_value = []
+        with patch("gptme.tools.shell_background.select.poll", return_value=poller):
+            assert _wait_readable([7], 0.0001) == []
+        poller.poll.assert_called_once_with(1)
+
+    def test_preserves_zero_timeout(self):
+        if not hasattr(__import__("select"), "poll"):
+            pytest.skip("select.poll is POSIX-only")
+        poller = Mock()
+        poller.poll.return_value = []
+        with patch("gptme.tools.shell_background.select.poll", return_value=poller):
+            assert _wait_readable([7], 0) == []
+        poller.poll.assert_called_once_with(0)
+
+    def test_raises_when_poll_unavailable(self):
+        class _NoPoll:
+            pass
+
+        with (
+            patch("gptme.tools.shell_background.select", _NoPoll()),
+            pytest.raises(OSError, match="select.poll is unavailable"),
+        ):
+            _wait_readable([7], 0)
+
+    def test_handles_fd_above_fd_setsize(self):
+        """A readable descriptor >= FD_SETSIZE must be reported, not raise."""
+        resource = pytest.importorskip("resource", reason="POSIX-only test")
+        pytest.importorskip("fcntl", reason="POSIX-only test")
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        needed = _FD_SETSIZE + _FD_SCAN_WINDOW + 16
+        if soft < needed:
+            if hard != resource.RLIM_INFINITY and hard < needed:
+                pytest.skip(f"RLIMIT_NOFILE hard limit {hard} < {needed}")
+            resource.setrlimit(resource.RLIMIT_NOFILE, (needed, hard))
+        read_fd, write_fd = os.pipe()
+        high_read_fd = None
+        try:
+            high_read_fd = _find_free_fd(_FD_SETSIZE)
+            os.dup2(read_fd, high_read_fd)
+            assert high_read_fd >= _FD_SETSIZE
+            os.write(write_fd, b"payload")
+            assert _wait_readable([high_read_fd], 1.0) == [high_read_fd]
+            assert os.read(high_read_fd, 16) == b"payload"
+        finally:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+            for fd in (high_read_fd, read_fd, write_fd):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+
+# ---------------------------------------------------------------------------
+# Module-level job registry
+# ---------------------------------------------------------------------------
+
+
+class TestJobRegistry:
+    def test_start_assigns_sequential_ids(self):
+        j1 = start_background_job("true")
+        j2 = start_background_job("true")
+        assert j2.id == j1.id + 1
+        j1.process.wait(timeout=5)
+        j2.process.wait(timeout=5)
+
+    def test_get_existing(self):
+        job = start_background_job("sleep 60")
+        found = get_background_job(job.id)
+        assert found is job
+        job.kill()
+
+    def test_get_nonexistent(self):
+        assert get_background_job(9999) is None
+
+    def test_list_returns_all(self):
+        j1 = start_background_job("sleep 60")
+        j2 = start_background_job("sleep 60")
+        jobs = list_background_jobs()
+        ids = {j.id for j in jobs}
+        assert j1.id in ids
+        assert j2.id in ids
+        j1.kill()
+        j2.kill()
+
+    def test_list_empty(self):
+        assert list_background_jobs() == []
+
+    def test_cleanup_keeps_finished_output_available(self):
+        job = start_background_job("printf kept")
+        job.process.wait(timeout=5)
+        if job._reader_thread:
+            job._reader_thread.join(timeout=5)
+        cleanup_finished_jobs()
+        assert get_background_job(job.id) is job
+        assert job.get_output()[0] == "kept"
+
+    def test_cleanup_keeps_running(self):
+        job = start_background_job("sleep 60")
+        cleanup_finished_jobs()
+        assert get_background_job(job.id) is not None
+        job.kill()
+
+    def test_reset_kills_and_clears(self):
+        j1 = start_background_job("sleep 60")
+        j2 = start_background_job("sleep 60")
+        reset_background_jobs()
+        assert not j1.is_running()
+        assert not j2.is_running()
+        assert list_background_jobs() == []
+
+    def test_reset_resets_id_counter(self):
+        start_background_job("true").process.wait(timeout=5)
+        reset_background_jobs()
+        j = start_background_job("true")
+        assert j.id == 1
+        j.process.wait(timeout=5)
+
+    def test_reset_purges_conversation_completion(self):
+        from types import SimpleNamespace
+
+        from gptme.hooks import current_conversation_id
+        from gptme.tools.shell_background import background_job_completion_hook
+
+        token = current_conversation_id.set("conversation-a")
+        try:
+            job = start_background_job("true")
+            job.process.wait(timeout=5)
+            if job._reader_thread:
+                job._reader_thread.join(timeout=5)
+            reset_background_jobs("conversation-a", all_conversations=False)
+        finally:
+            current_conversation_id.reset(token)
+
+        assert (
+            list(
+                background_job_completion_hook(
+                    SimpleNamespace(chat_id="conversation-a"), True, []
+                )
+            )
+            == []
+        )
+
+    def test_reset_purge_does_not_drop_concurrent_completion(self):
+        from threading import Event, Thread
+
+        from gptme.tools import shell_background
+
+        old_job = _make_job()
+        old_job.conversation_id = "conversation-a"
+        new_job = _make_job()
+        new_job.conversation_id = "conversation-b"
+        shell_background._completion_queue.put(old_job)
+
+        purge_started = Event()
+        producer_attempted = Event()
+        release_purge = Event()
+        original_mutex = shell_background._completion_queue.mutex
+
+        class CoordinatedMutex:
+            def __enter__(self) -> None:
+                original_mutex.acquire()
+                purge_started.set()
+                assert producer_attempted.wait(timeout=5)
+
+            def __exit__(self, *_args: object) -> None:
+                original_mutex.release()
+                release_purge.set()
+
+        def producer() -> None:
+            assert purge_started.wait(timeout=5)
+            producer_attempted.set()
+            shell_background._completion_queue.put(new_job)
+
+        producer_thread = Thread(target=producer)
+        producer_thread.start()
+        with patch.object(
+            shell_background._completion_queue, "mutex", CoordinatedMutex()
+        ):
+            shell_background._purge_completion_queue({"conversation-a"})
+        assert release_purge.is_set()
+        producer_thread.join(timeout=5)
+
+        assert not producer_thread.is_alive()
+        assert shell_background._completion_queue.get_nowait() is new_job
+
+
+# ---------------------------------------------------------------------------
+# Command handlers — execute_bg_command
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteBgCommand:
+    def test_empty_command(self):
+        msgs = list(execute_bg_command(""))
+        assert len(msgs) == 1
+        assert "Usage" in msgs[0].content
+
+    def test_whitespace_command(self):
+        msgs = list(execute_bg_command("   "))
+        assert len(msgs) == 1
+        assert "Usage" in msgs[0].content
+
+    def test_valid_command(self):
+        msgs = list(execute_bg_command("echo test_bg"))
+        assert len(msgs) == 1
+        assert "Started background job" in msgs[0].content
+        assert "#" in msgs[0].content
+
+    def test_denylisted_command(self):
+        """Commands on the deny list should be rejected."""
+        msgs = list(execute_bg_command("rm -rf /"))
+        assert len(msgs) == 1
+        assert "denied" in msgs[0].content.lower()
+
+
+# ---------------------------------------------------------------------------
+# Command handlers — execute_jobs_command
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteJobsCommand:
+    def test_no_jobs(self):
+        msgs = list(execute_jobs_command())
+        assert len(msgs) == 1
+        assert "No background jobs" in msgs[0].content
+
+    def test_with_running_job(self):
+        start_background_job("sleep 60")
+        msgs = list(execute_jobs_command())
+        assert len(msgs) == 1
+        assert "Running" in msgs[0].content
+
+    def test_format_short_elapsed(self):
+        """Jobs running <60s show seconds."""
+        start_background_job("sleep 60")
+        msgs = list(execute_jobs_command())
+        assert re.search(r"\(\d+\.\d+s\):", msgs[0].content), msgs[0].content
+
+    def test_long_command_truncated(self):
+        # Keep the job alive long enough to survive cleanup in execute_jobs_command().
+        long_cmd = "sleep 60 # " + "x" * 100
+        start_background_job(long_cmd)
+        msgs = list(execute_jobs_command())
+        assert "..." in msgs[0].content
+
+
+# ---------------------------------------------------------------------------
+# Command handlers — execute_output_command
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteOutputCommand:
+    def test_invalid_id_string(self):
+        msgs = list(execute_output_command("abc"))
+        assert len(msgs) == 1
+        assert "Invalid job ID" in msgs[0].content
+
+    def test_nonexistent_id(self):
+        msgs = list(execute_output_command("999"))
+        assert len(msgs) == 1
+        assert "No job with ID" in msgs[0].content
+
+    def test_running_job_output(self):
+        job = start_background_job("sleep 60")
+        msgs = list(execute_output_command(str(job.id)))
+        assert len(msgs) == 1
+        assert "Running" in msgs[0].content
+        assert "No output yet" in msgs[0].content
+        assert "stdout" not in msgs[0].content
+        job.kill()
+
+    def test_finished_job_output(self):
+        job = start_background_job("echo done_marker")
+        job.process.wait(timeout=5)
+        time.sleep(0.5)
+        msgs = list(execute_output_command(str(job.id)))
+        assert len(msgs) == 1
+        assert "done_marker" in msgs[0].content
+        assert "Finished" in msgs[0].content
+
+    def test_no_output_message(self):
+        """A finished job with no output still shows the placeholder message."""
+        job = start_background_job("true")
+        job.process.wait(timeout=5)
+        time.sleep(0.3)
+        msgs = list(execute_output_command(str(job.id)))
+        assert "Finished" in msgs[0].content
+        assert "No output yet" in msgs[0].content
+
+    def test_long_stdout_truncated(self):
+        """Stdout longer than 8000 chars should be truncated."""
+        # Generate >8000 chars
+        job = start_background_job(f"{sys.executable} -c \"print('A' * 10000)\"")
+        job.process.wait(timeout=10)
+        time.sleep(0.5)
+        msgs = list(execute_output_command(str(job.id)))
+        assert "truncated" in msgs[0].content
+
+    def test_long_stderr_truncated(self):
+        """Stderr longer than 2000 chars should be truncated."""
+        job = start_background_job(
+            f"{sys.executable} -c \"import sys; sys.stderr.write('E' * 3000)\""
+        )
+        job.process.wait(timeout=10)
+        time.sleep(0.5)
+        msgs = list(execute_output_command(str(job.id)))
+        assert "truncated" in msgs[0].content
+
+
+# ---------------------------------------------------------------------------
+# Command handlers — execute_kill_command
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteKillCommand:
+    def test_invalid_id_string(self):
+        msgs = list(execute_kill_command("xyz"))
+        assert len(msgs) == 1
+        assert "Invalid job ID" in msgs[0].content
+
+    def test_nonexistent_id(self):
+        msgs = list(execute_kill_command("888"))
+        assert len(msgs) == 1
+        assert "No job with ID" in msgs[0].content
+
+    def test_kill_running_job(self):
+        job = start_background_job("sleep 60")
+        msgs = list(execute_kill_command(str(job.id)))
+        assert len(msgs) == 1
+        assert "Terminated" in msgs[0].content
+        assert not job.is_running()
+
+    def test_kill_finished_job(self):
+        job = start_background_job("true")
+        job.process.wait(timeout=5)
+        time.sleep(0.3)
+        msgs = list(execute_kill_command(str(job.id)))
+        assert "already finished" in msgs[0].content
+
+
+# ---------------------------------------------------------------------------
+# Thread-safety
+# ---------------------------------------------------------------------------
+
+
+class TestThreadSafety:
+    def test_concurrent_start(self):
+        """Multiple threads starting jobs concurrently should not collide."""
+        import threading
+
+        jobs: list[BackgroundJob] = []
+        lock = threading.Lock()
+
+        def _start():
+            j = start_background_job("true")
+            with lock:
+                jobs.append(j)
+
+        threads = [threading.Thread(target=_start) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        # All 10 jobs should have unique IDs
+        ids = {j.id for j in jobs}
+        assert len(ids) == 10
+
+        # Wait for all processes and their output readers to finish.
+        for j in jobs:
+            j.process.wait(timeout=5)
+            assert j._reader_thread is not None
+            j._reader_thread.join(timeout=2)
+            assert not j._reader_thread.is_alive()
+
+    def test_concurrent_get_output(self):
+        """Reading output while writer thread is active should not crash."""
+        job = start_background_job(
+            f'{sys.executable} -c "import time; [print(i) or time.sleep(0.01) for i in range(50)]"'
+        )
+        # Poll output several times while the process is running
+        results = []
+        for _ in range(5):
+            stdout, stderr = job.get_output()
+            results.append(stdout)
+            time.sleep(0.05)
+
+        job.process.wait(timeout=10)
+        time.sleep(0.5)
+        final_stdout, _ = job.get_output()
+        # Final output should contain all numbers
+        assert "49" in final_stdout
+
+
+# ---------------------------------------------------------------------------
+# Edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeCases:
+    def test_process_crash_detected(self):
+        """A job whose process exits with error should report finished."""
+        job = start_background_job("exit 42")
+        job.process.wait(timeout=5)
+        time.sleep(0.3)
+        assert not job.is_running()
+        assert job.process.returncode == 42
+
+    def test_binary_output_handled(self):
+        """Non-UTF-8 output should be handled via errors='replace'."""
+        job = start_background_job(
+            f"{sys.executable} -c \"import sys; sys.stdout.buffer.write(b'\\xff\\xfe\\x00hello')\""
+        )
+        job.process.wait(timeout=5)
+        time.sleep(0.5)
+        stdout, _ = job.get_output()
+        assert "hello" in stdout  # valid portion preserved
+
+    @pytest.mark.slow
+    def test_rapid_start_and_kill(self):
+        """Starting and immediately killing should not hang or raise."""
+        for _ in range(5):
+            job = start_background_job("sleep 60")
+            job.kill()
+            assert not job.is_running()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_job() -> BackgroundJob:
+    """Create a BackgroundJob with a dummy no-op process for unit testing."""
+    proc = subprocess.Popen(
+        ["true"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+    )
+    return BackgroundJob(
+        id=0,
+        command="true",
+        process=proc,
+        start_time=time.time(),
+        process_group_id=None if sys.platform == "win32" else proc.pid,
+    )
+
+
+class TestCompletionNotifications:
+    def test_completion_hook_routes_to_own_conversation(self):
+        from types import SimpleNamespace
+
+        from gptme.hooks import current_conversation_id
+        from gptme.tools.shell_background import background_job_completion_hook
+
+        token = current_conversation_id.set("conversation-a")
+        try:
+            job = start_background_job("printf notified")
+            # Completion is published by the reader thread after it has drained
+            # both pipes, not merely when the child process exits.
+            assert job._reader_thread is not None
+            job._reader_thread.join(timeout=5)
+            assert not job._reader_thread.is_alive()
+        finally:
+            current_conversation_id.reset(token)
+
+        wrong = list(
+            background_job_completion_hook(
+                SimpleNamespace(chat_id="conversation-b"), True, []
+            )
+        )
+        assert wrong == []
+
+        messages = list(
+            background_job_completion_hook(
+                SimpleNamespace(chat_id="conversation-a"), True, []
+            )
+        )
+        assert len(messages) == 1
+        assert f"job #{job.id} finished" in messages[0].content
+        assert "notified" in messages[0].content
+
+    @pytest.mark.parametrize(
+        "manager", [object(), pytest.param(None, id="none-manager")]
+    )
+    def test_completion_hook_uses_active_context_without_manager_id(self, manager):
+        from gptme.hooks import current_conversation_id
+        from gptme.tools import shell_background
+
+        job = _make_job()
+        job.id = 1
+        job.conversation_id = "conversation-a"
+        shell_background._background_jobs["conversation-a"] = {1: job}
+        shell_background._completion_queue.put(job)
+
+        token = current_conversation_id.set("conversation-a")
+        try:
+            messages = list(
+                shell_background.background_job_completion_hook(manager, True, [])
+            )
+        finally:
+            current_conversation_id.reset(token)
+
+        assert len(messages) == 1
+        assert "job #1 finished" in messages[0].content
+
+    def test_completion_hook_prefers_manager_over_conflicting_context(self):
+        from types import SimpleNamespace
+
+        from gptme.hooks import current_conversation_id
+        from gptme.tools import shell_background
+
+        job_a = _make_job()
+        job_a.id = 1
+        job_a.conversation_id = "conversation-a"
+        job_b = _make_job()
+        job_b.id = 1
+        job_b.conversation_id = "conversation-b"
+        shell_background._background_jobs.update(
+            {"conversation-a": {1: job_a}, "conversation-b": {1: job_b}}
+        )
+        shell_background._completion_queue.put(job_a)
+        shell_background._completion_queue.put(job_b)
+
+        token = current_conversation_id.set("conversation-a")
+        try:
+            messages = list(
+                shell_background.background_job_completion_hook(
+                    SimpleNamespace(chat_id="conversation-b"), True, []
+                )
+            )
+        finally:
+            current_conversation_id.reset(token)
+
+        assert len(messages) == 1
+        assert "job #1 finished" in messages[0].content
+        assert job_a in shell_background._completion_queue.queue
+        assert job_b not in shell_background._completion_queue.queue
+
+    def test_completion_hook_prefers_manager_over_stale_log_context(self, tmp_path):
+        from types import SimpleNamespace
+
+        from gptme.logmanager import LogManager
+        from gptme.tools import shell_background
+
+        # Constructing a manager binds it as the current process-local log, but
+        # the hook argument still names the conversation being advanced.
+        LogManager(logdir=tmp_path / "stale-conversation", lock=False)
+        job = _make_job()
+        job.id = 1
+        job.conversation_id = "conversation-a"
+        shell_background._background_jobs["conversation-a"] = {1: job}
+        shell_background._completion_queue.put(job)
+
+        messages = list(
+            shell_background.background_job_completion_hook(
+                SimpleNamespace(chat_id="conversation-a"), True, []
+            )
+        )
+
+        assert len(messages) == 1
+        assert "job #1 finished" in messages[0].content
+
+    def test_completion_hook_does_not_use_stale_log_context(self, tmp_path):
+        from types import SimpleNamespace
+
+        from gptme.logmanager import LogManager
+        from gptme.tools import shell_background
+
+        LogManager(logdir=tmp_path / "conversation-a", lock=False)
+        job = _make_job()
+        job.id = 1
+        job.conversation_id = "conversation-a"
+        shell_background._background_jobs["conversation-a"] = {1: job}
+        shell_background._completion_queue.put(job)
+
+        messages = list(
+            shell_background.background_job_completion_hook(
+                SimpleNamespace(chat_id=None), True, []
+            )
+        )
+
+        assert messages == []
+
+    def test_completion_hook_claims_conversation_jobs_atomically(self):
+        from types import SimpleNamespace
+
+        from gptme.tools import shell_background
+
+        job_a = _make_job()
+        job_a.id = 1
+        job_a.conversation_id = "conversation-a"
+        job_b = _make_job()
+        job_b.id = 1
+        job_b.conversation_id = "conversation-b"
+        shell_background._background_jobs.update(
+            {"conversation-a": {1: job_a}, "conversation-b": {1: job_b}}
+        )
+        shell_background._completion_queue.put(job_a)
+        shell_background._completion_queue.put(job_b)
+
+        results: dict[str, list] = {}
+
+        def deliver(conversation_id: str) -> None:
+            results[conversation_id] = list(
+                shell_background.background_job_completion_hook(
+                    SimpleNamespace(chat_id=conversation_id), True, []
+                )
+            )
+
+        threads = [
+            Thread(target=deliver, args=("conversation-a",)),
+            Thread(target=deliver, args=("conversation-b",)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert "conversation-a" in results
+        assert "conversation-b" in results
+        assert len(results["conversation-a"]) == 1
+        assert len(results["conversation-b"]) == 1
+
+    def test_completion_delivery_is_atomic_with_reset(self):
+        from threading import Event, Thread
+        from types import SimpleNamespace
+
+        from gptme.tools import shell_background
+
+        job = _make_job()
+        job.id = 1
+        job.conversation_id = "conversation-a"
+        shell_background._background_jobs["conversation-a"] = {1: job}
+        shell_background._completion_queue.put(job)
+
+        delivery_started = Event()
+        release_delivery = Event()
+        original_mutex = shell_background._completion_queue.mutex
+
+        class CoordinatedMutex:
+            def __enter__(self) -> None:
+                delivery_started.set()
+                assert release_delivery.wait(timeout=5)
+                original_mutex.acquire()
+
+            def __exit__(self, *_args: object) -> None:
+                original_mutex.release()
+
+        messages: list = []
+
+        def deliver() -> None:
+            with patch.object(
+                shell_background._completion_queue, "mutex", CoordinatedMutex()
+            ):
+                messages.extend(
+                    shell_background.background_job_completion_hook(
+                        SimpleNamespace(chat_id="conversation-a"), True, []
+                    )
+                )
+
+        delivery_thread = Thread(target=deliver)
+        delivery_thread.start()
+        assert delivery_started.wait(timeout=5)
+
+        reset_done = Event()
+
+        def reset() -> None:
+            shell_background.reset_background_jobs(
+                "conversation-a", all_conversations=False
+            )
+            reset_done.set()
+
+        reset_thread = Thread(target=reset)
+        reset_thread.start()
+        assert not reset_done.wait(timeout=0.05)
+        release_delivery.set()
+        delivery_thread.join(timeout=5)
+        reset_thread.join(timeout=5)
+
+        assert not delivery_thread.is_alive()
+        assert not reset_thread.is_alive()
+        assert len(messages) == 1
+        assert shell_background._background_jobs.get("conversation-a") is None
+
+    def test_stale_completion_does_not_target_reused_job_id(self):
+        from types import SimpleNamespace
+
+        from gptme.hooks import current_conversation_id
+        from gptme.tools.shell_background import background_job_completion_hook
+
+        token = current_conversation_id.set("conversation-a")
+        try:
+            old_job = start_background_job("true")
+            old_job.process.wait(timeout=5)
+            if old_job._reader_thread:
+                old_job._reader_thread.join(timeout=5)
+            reset_background_jobs("conversation-a", all_conversations=False)
+            new_job = start_background_job("sleep 60")
+            assert new_job.id == old_job.id
+        finally:
+            current_conversation_id.reset(token)
+
+        messages = list(
+            background_job_completion_hook(
+                SimpleNamespace(chat_id="conversation-a"), True, []
+            )
+        )
+        assert messages == []
+        new_job.kill()
+
+    def test_registry_is_conversation_scoped(self):
+        from gptme.hooks import current_conversation_id
+
+        token_a = current_conversation_id.set("conversation-a")
+        try:
+            job_a = start_background_job("sleep 60")
+            assert get_background_job(job_a.id) is job_a
+        finally:
+            current_conversation_id.reset(token_a)
+
+        token_b = current_conversation_id.set("conversation-b")
+        try:
+            assert get_background_job(job_a.id) is None
+            job_b = start_background_job("sleep 60")
+            assert job_b.id == 1
+            assert get_background_job(job_b.id) is job_b
+        finally:
+            current_conversation_id.reset(token_b)
+
+
+def test_session_end_cleans_up_conversation_jobs():
+    from types import SimpleNamespace
+    from typing import cast
+    from unittest.mock import patch
+
+    from gptme.hooks import current_conversation_id
+    from gptme.logmanager import LogManager
+    from gptme.tools.shell import _session_end_shell_cleanup
+
+    token = current_conversation_id.set("conversation-a")
+    try:
+        job = start_background_job("sleep 60")
+    finally:
+        current_conversation_id.reset(token)
+
+    manager = SimpleNamespace(
+        logdir=SimpleNamespace(name="conversation-a"), chat_id="conversation-a"
+    )
+    with patch("gptme.tools.shell.close_conversation_shell"):
+        assert list(_session_end_shell_cleanup(cast(LogManager, manager))) == []
+
+    assert not job.is_running()
+    token = current_conversation_id.set("conversation-a")
+    try:
+        assert get_background_job(job.id) is None
+    finally:
+        current_conversation_id.reset(token)

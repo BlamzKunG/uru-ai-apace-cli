@@ -1,0 +1,1548 @@
+import '@testing-library/jest-dom';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { observable } from '@legendapp/state';
+import { SetupWizard } from '../SetupWizard';
+import { SettingsProvider } from '@/contexts/SettingsContext';
+import { setupWizard$ } from '@/stores/setupWizard';
+import { toast } from 'sonner';
+
+const mockConnect = jest.fn();
+const mockOpen = jest.fn();
+const mockFetch = jest.fn();
+const mockInvokeTauri = jest.fn();
+const mockProcessConnectionFromHash = jest.fn();
+const mockIsDemoMode = jest.fn(() => false);
+const isConnected$ = observable(false);
+const mockIsTauriEnvironment = jest.fn(() => false);
+const CLOUD_AUTH_BASE_URL = process.env['VITE_GPTME_CLOUD_BASE_URL'] || 'https://gptme.ai';
+const CLOUD_AUTH_URL = `${CLOUD_AUTH_BASE_URL}/authorize`;
+const CLOUD_AUTH_ORIGIN = new URL(CLOUD_AUTH_URL).origin;
+
+// Replaces window.location with a stub for the given href.
+//
+// jsdom's Location exposes its fields as own enumerable properties, so the
+// spread does copy `pathname`/`search`/`protocol`/… — but it copies them from
+// the *previous* location, which would leave the stub internally inconsistent
+// with the href being set. Derive every URL-ish field from the URL instead, and
+// keep the navigation methods as no-op jest mocks so a stray call is inert
+// rather than a TypeError.
+const setLocation = (href: string) => {
+  const url = new URL(href);
+  Object.defineProperty(window, 'location', {
+    value: {
+      assign: jest.fn(),
+      replace: jest.fn(),
+      reload: jest.fn(),
+      toString: () => url.href,
+      href: url.href,
+      origin: url.origin,
+      protocol: url.protocol,
+      host: url.host,
+      hostname: url.hostname,
+      port: url.port,
+      pathname: url.pathname,
+      search: url.search,
+      hash: url.hash,
+    },
+    writable: true,
+    configurable: true,
+  });
+};
+
+type MockTauriServerStatus = {
+  running: boolean;
+  port: number;
+  port_available: boolean;
+  manages_local_server: boolean;
+};
+
+type MockUseTauriServerStatusResult = {
+  isLoading: boolean;
+  managesLocalServer: boolean | null;
+  serverStatus: MockTauriServerStatus | null;
+};
+
+const mockUseTauriServerStatus = jest.fn(
+  (): MockUseTauriServerStatusResult => ({
+    isLoading: false,
+    managesLocalServer: false,
+    serverStatus: null,
+  })
+);
+
+jest.mock('@/contexts/ApiContext', () => ({
+  useApi: () => ({
+    api: {
+      baseUrl: 'http://127.0.0.1:5700',
+      authHeader: null,
+    },
+    isConnected$,
+    connect: mockConnect,
+    connectionConfig: {
+      baseUrl: 'http://127.0.0.1:5700',
+      authToken: null,
+      useAuthToken: false,
+    },
+  }),
+}));
+
+jest.mock('@/utils/tauri', () => ({
+  isTauriEnvironment: () => mockIsTauriEnvironment(),
+  invokeTauri: (...args: unknown[]) => mockInvokeTauri(...args),
+}));
+
+jest.mock('@/hooks/useTauriServerStatus', () => ({
+  useTauriServerStatus: () => mockUseTauriServerStatus(),
+}));
+
+jest.mock('@/utils/connectionConfig', () => ({
+  processConnectionFromHash: (...args: unknown[]) => mockProcessConnectionFromHash(...args),
+  isDemoMode: () => mockIsDemoMode(),
+}));
+
+jest.mock('@legendapp/state/react', () => ({
+  use$: (obs: { get: () => unknown }) => obs.get(),
+}));
+
+// Mock the Dialog primitives. The real DialogContent (from `@/components/ui/dialog`)
+// renders a Radix `<DialogPrimitive.Close>` X button that calls `onOpenChange(false)`
+// when clicked. Mirror that here so tests can exercise the close behavior wired
+// through `onOpenChange` (e.g. the welcome step's X close → closeWizard path).
+jest.mock('@/components/ui/dialog', () => {
+  const DialogContext = (jest.requireActual('react') as typeof import('react')).createContext<
+    ((open: boolean) => void) | null
+  >(null);
+  const useContext = (jest.requireActual('react') as typeof import('react')).useContext;
+  return {
+    Dialog: ({
+      open,
+      onOpenChange,
+      children,
+    }: {
+      open: boolean;
+      onOpenChange?: (open: boolean) => void;
+      children: React.ReactNode;
+    }) =>
+      open ? (
+        <DialogContext.Provider value={onOpenChange ?? null}>
+          <div>{children}</div>
+        </DialogContext.Provider>
+      ) : null,
+    DialogContent: ({ children }: { children: React.ReactNode }) => {
+      const onOpenChange = useContext(DialogContext);
+      return (
+        <div>
+          {children}
+          <button aria-label="Close" onClick={() => onOpenChange?.(false)}>
+            <span>X</span>
+          </button>
+        </div>
+      );
+    },
+    DialogDescription: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+    DialogFooter: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+    DialogHeader: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+    DialogTitle: ({ children }: { children: React.ReactNode }) => <h1>{children}</h1>,
+  };
+});
+
+jest.mock('@/components/ui/button', () => ({
+  Button: ({ children, ...props }: React.ButtonHTMLAttributes<HTMLButtonElement>) => (
+    <button {...props}>{children}</button>
+  ),
+}));
+
+jest.mock('@/components/ui/input', () => ({
+  Input: (props: React.InputHTMLAttributes<HTMLInputElement>) => <input {...props} />,
+}));
+
+jest.mock('@/components/ui/label', () => ({
+  Label: ({
+    children,
+    ...props
+  }: React.LabelHTMLAttributes<HTMLLabelElement> & { children: React.ReactNode }) => (
+    <label {...props}>{children}</label>
+  ),
+}));
+
+jest.mock('lucide-react', () => ({
+  Monitor: () => <span>Monitor</span>,
+  Cloud: () => <span>Cloud</span>,
+  ArrowRight: () => <span>ArrowRight</span>,
+  Check: () => <span>Check</span>,
+  Terminal: () => <span>Terminal</span>,
+  ExternalLink: () => <span>ExternalLink</span>,
+  Copy: () => <span>Copy</span>,
+}));
+
+jest.mock('sonner', () => ({
+  toast: { success: jest.fn(), error: jest.fn(), warning: jest.fn() },
+}));
+
+describe('SetupWizard', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    setLocation('http://localhost/');
+    isConnected$.set(false);
+    setupWizard$.step.set('welcome');
+    setupWizard$.open.set(false);
+    setupWizard$.providerStatusVersion.set(0);
+    mockConnect.mockReset();
+    mockOpen.mockReset();
+    mockFetch.mockReset();
+    mockInvokeTauri.mockReset();
+    mockProcessConnectionFromHash.mockReset();
+    mockIsDemoMode.mockReturnValue(false);
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ provider_configured: true }),
+    });
+    mockProcessConnectionFromHash.mockResolvedValue({
+      baseUrl: 'https://fleet.gptme.ai/api/v1/instances/test',
+      authToken: 'tok-123',
+      useAuthToken: true,
+    });
+    Object.defineProperty(window, 'fetch', {
+      writable: true,
+      value: mockFetch,
+    });
+    mockIsTauriEnvironment.mockReturnValue(false);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: false,
+      serverStatus: null,
+    });
+    Object.defineProperty(window, 'open', {
+      writable: true,
+      value: mockOpen,
+    });
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        writeText: jest.fn().mockResolvedValue(undefined),
+      },
+    });
+    (toast.success as jest.Mock).mockClear();
+    (toast.error as jest.Mock).mockClear();
+    (toast.warning as jest.Mock).mockClear();
+  });
+
+  it('stays closed in demo mode even for first-time users', () => {
+    mockIsDemoMode.mockReturnValue(true);
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    expect(screen.queryByRole('heading', { name: /welcome to gptme/i })).not.toBeInTheDocument();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('does not auto-open on chat.gptme.org for first-time visitors', () => {
+    setLocation('https://chat.gptme.org/');
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    expect(screen.queryByRole('heading', { name: /welcome to gptme/i })).not.toBeInTheDocument();
+  });
+
+  it.each(['http://192.168.1.20/', 'https://gptme.internal.example/'])(
+    'still auto-opens on self-hosted origin %s',
+    (origin) => {
+      setLocation(origin);
+
+      render(
+        <SettingsProvider>
+          <SetupWizard />
+        </SettingsProvider>
+      );
+
+      expect(screen.getByRole('heading', { name: /welcome to gptme/i })).toBeInTheDocument();
+    }
+  );
+
+  it('still auto-opens in Tauri', () => {
+    setLocation('http://tauri.localhost/');
+    mockIsTauriEnvironment.mockReturnValue(true);
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    expect(screen.getByRole('heading', { name: /welcome to gptme/i })).toBeInTheDocument();
+  });
+
+  it('still opens on hosted origins when requested explicitly', async () => {
+    setLocation('https://chat.gptme.org/');
+    setupWizard$.open.set(true);
+    setupWizard$.step.set('welcome');
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    expect(await screen.findByRole('heading', { name: /welcome to gptme/i })).toBeInTheDocument();
+  });
+
+  it('closes the wizard via Skip on the welcome step and persists hasCompletedSetup', async () => {
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    expect(screen.getByRole('heading', { name: /welcome to gptme/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /skip for now/i }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole('heading', { name: /welcome to gptme/i })).not.toBeInTheDocument();
+    });
+
+    expect(JSON.parse(localStorage.getItem('gptme-settings') || '{}')).toMatchObject({
+      hasCompletedSetup: true,
+    });
+  });
+
+  it('closes the wizard via the X close button and persists hasCompletedSetup', async () => {
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    expect(screen.getByRole('heading', { name: /welcome to gptme/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /^close$/i }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole('heading', { name: /welcome to gptme/i })).not.toBeInTheDocument();
+    });
+
+    expect(JSON.parse(localStorage.getItem('gptme-settings') || '{}')).toMatchObject({
+      hasCompletedSetup: true,
+    });
+  });
+
+  it('waits for cloud connection before showing completion', async () => {
+    const { rerender } = render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /cloud/i }));
+    fireEvent.click(screen.getByRole('button', { name: /sign in to gptme.ai/i }));
+
+    expect(mockOpen).toHaveBeenCalledWith(CLOUD_AUTH_URL, '_blank');
+    expect(screen.getByText(/waiting for sign-in to complete/i)).toBeInTheDocument();
+    expect(screen.queryByText(/you're all set/i)).not.toBeInTheDocument();
+
+    isConnected$.set(true);
+    rerender(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /you're all set/i })).toBeInTheDocument();
+    });
+  });
+
+  it('processes cloud auth codes posted back from the authorize popup', async () => {
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /cloud/i }));
+    fireEvent.click(screen.getByRole('button', { name: /sign in to gptme.ai/i }));
+
+    await act(async () => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          origin: CLOUD_AUTH_ORIGIN,
+          data: {
+            type: 'gptme-cloud-auth-code',
+            code: 'deadbeef',
+          },
+        })
+      );
+    });
+
+    await waitFor(() => {
+      expect(mockProcessConnectionFromHash).toHaveBeenCalledWith('code=deadbeef');
+    });
+
+    await waitFor(() => {
+      expect(mockConnect).toHaveBeenCalledWith({
+        baseUrl: 'https://fleet.gptme.ai/api/v1/instances/test',
+        authToken: 'tok-123',
+        useAuthToken: true,
+      });
+    });
+  });
+
+  it('ignores duplicate cloud auth postMessages (once-guard)', async () => {
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /cloud/i }));
+    fireEvent.click(screen.getByRole('button', { name: /sign in to gptme.ai/i }));
+
+    const authMessage = new MessageEvent('message', {
+      origin: CLOUD_AUTH_ORIGIN,
+      data: { type: 'gptme-cloud-auth-code', code: 'deadbeef' },
+    });
+
+    await act(async () => {
+      window.dispatchEvent(authMessage);
+      window.dispatchEvent(authMessage); // duplicate
+    });
+
+    await waitFor(() => {
+      expect(mockProcessConnectionFromHash).toHaveBeenCalledTimes(1);
+    });
+
+    expect(mockConnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows retrying cloud auth after a failed code exchange', async () => {
+    mockProcessConnectionFromHash
+      .mockRejectedValueOnce(new Error('expired code'))
+      .mockResolvedValueOnce({
+        baseUrl: 'https://fleet.gptme.ai/api/v1/instances/test',
+        authToken: 'tok-123',
+        useAuthToken: true,
+      });
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /cloud/i }));
+    fireEvent.click(screen.getByRole('button', { name: /sign in to gptme.ai/i }));
+
+    await act(async () => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          origin: CLOUD_AUTH_ORIGIN,
+          data: { type: 'gptme-cloud-auth-code', code: 'expired' },
+        })
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('expired code')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /sign in to gptme.ai/i }));
+
+    await act(async () => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          origin: CLOUD_AUTH_ORIGIN,
+          data: { type: 'gptme-cloud-auth-code', code: 'fresh-code' },
+        })
+      );
+    });
+
+    await waitFor(() => {
+      expect(mockProcessConnectionFromHash).toHaveBeenNthCalledWith(2, 'code=fresh-code');
+    });
+
+    await waitFor(() => {
+      expect(mockConnect).toHaveBeenCalledWith({
+        baseUrl: 'https://fleet.gptme.ai/api/v1/instances/test',
+        authToken: 'tok-123',
+        useAuthToken: true,
+      });
+    });
+  });
+
+  it('marks setup complete after local connect succeeds', async () => {
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /monitor local/i }));
+    fireEvent.click(screen.getByRole('button', { name: /connect/i }));
+
+    await waitFor(() => {
+      expect(mockConnect).toHaveBeenCalled();
+    });
+
+    await waitFor(() => {
+      expect(mockFetch).toHaveBeenCalledWith(
+        'http://127.0.0.1:5700/api/v2',
+        expect.objectContaining({
+          headers: {},
+          targetAddressSpace: 'loopback',
+        })
+      );
+    });
+
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem('gptme-settings') || '{}')).toMatchObject({
+        hasCompletedSetup: true,
+      });
+    });
+    expect(setupWizard$.providerStatusVersion.get()).toBe(1);
+    expect(screen.getByRole('heading', { name: /you're all set/i })).toBeInTheDocument();
+  });
+
+  it('shows copyable local server commands for installed and first-time users', async () => {
+    const writeText = jest.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    const serverCommand = `gptme-server --cors-origin='${window.location.origin}'`;
+    const pipxRunCommand = `pipx run --spec 'gptme[server]' ${serverCommand}`;
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /monitor local/i }));
+
+    expect(screen.getByText(serverCommand)).toBeInTheDocument();
+    expect(screen.getByText(pipxRunCommand)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /copy pipx run server command/i }));
+
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith(pipxRunCommand);
+    });
+    expect(toast.success).toHaveBeenCalledWith('Command copied to clipboard');
+  });
+
+  it('shows an error toast when copying the local server command fails', async () => {
+    const writeText = jest.fn().mockRejectedValue(new Error('clipboard denied'));
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    const serverCommand = `gptme-server --cors-origin='${window.location.origin}'`;
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /monitor local/i }));
+    fireEvent.click(screen.getByRole('button', { name: /copy installed server command/i }));
+
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith(serverCommand);
+      expect(toast.error).toHaveBeenCalledWith('Failed to copy command. Please copy it manually.');
+    });
+  });
+
+  it('shows desktop API key entry when the local server lacks a provider', async () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: true,
+      serverStatus: {
+        running: true,
+        port: 5700,
+        port_available: false,
+        manages_local_server: true,
+      },
+    });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ provider_configured: false }),
+    });
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /monitor local/i }));
+    fireEvent.click(screen.getByRole('button', { name: /connect/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+    });
+
+    expect(screen.getByRole('button', { name: /use gptme.ai instead/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /i configured a provider/i })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: /openrouter/i })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: /gemini/i })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: /deepseek/i })).toBeInTheDocument();
+    expect(JSON.parse(localStorage.getItem('gptme-settings') || '{}')).not.toMatchObject({
+      hasCompletedSetup: true,
+    });
+  });
+
+  it('reopens directly to provider setup when requested externally', async () => {
+    localStorage.setItem('gptme-settings', JSON.stringify({ hasCompletedSetup: true }));
+
+    const { rerender } = render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    expect(
+      screen.queryByRole('heading', { name: /configure a provider/i })
+    ).not.toBeInTheDocument();
+
+    act(() => {
+      setupWizard$.step.set('provider');
+      setupWizard$.open.set(true);
+    });
+
+    rerender(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+    });
+  });
+
+  it('keeps the cloud step visible when switching from provider fallback', async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ provider_configured: false }),
+    });
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /monitor local/i }));
+    fireEvent.click(screen.getByRole('button', { name: /connect/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /use gptme.ai instead/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /cloud setup/i })).toBeInTheDocument();
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(
+      screen.queryByRole('heading', { name: /configure a provider/i })
+    ).not.toBeInTheDocument();
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('supports cloud setup on remote-only tauri builds', async () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: false,
+      serverStatus: {
+        running: false,
+        port: 5700,
+        port_available: false,
+        manages_local_server: false,
+      },
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+
+    const cloudButton = screen.getByRole('button', { name: /cloud/i });
+    expect(cloudButton).toBeEnabled();
+    expect(screen.queryByText(/not ready on this mobile build yet/i)).not.toBeInTheDocument();
+
+    fireEvent.click(cloudButton);
+    mockInvokeTauri.mockResolvedValue(undefined);
+    fireEvent.click(screen.getByRole('button', { name: /sign in to gptme.ai/i }));
+
+    // Must go through the opener plugin, not window.open: on Android the
+    // in-WebView navigation would unload the SPA that handles the callback.
+    await waitFor(() =>
+      expect(mockInvokeTauri).toHaveBeenCalledWith('plugin:opener|open_url', {
+        url: CLOUD_AUTH_URL,
+      })
+    );
+    expect(mockOpen).not.toHaveBeenCalled();
+    expect(screen.getByText(/waiting for sign-in to complete/i)).toBeInTheDocument();
+  });
+
+  it('surfaces a recoverable error when the tauri opener plugin fails', async () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: false,
+      serverStatus: {
+        running: false,
+        port: 5700,
+        port_available: false,
+        manages_local_server: false,
+      },
+    });
+    mockInvokeTauri.mockRejectedValue(new Error('opener unavailable'));
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /cloud/i }));
+    fireEvent.click(screen.getByRole('button', { name: /sign in to gptme.ai/i }));
+
+    // Falling back to window.open() would re-enter the in-WebView navigation
+    // this branch exists to avoid, so the user gets an actionable error instead.
+    await waitFor(() =>
+      expect(screen.getByText(/could not open the browser automatically/i)).toBeInTheDocument()
+    );
+    // The error must name the URL so the user can open it manually.
+    expect(screen.getByText(/could not open the browser automatically/i)).toHaveTextContent(
+      CLOUD_AUTH_URL
+    );
+    expect(mockOpen).not.toHaveBeenCalled();
+    expect(screen.queryByText(/waiting for sign-in to complete/i)).not.toBeInTheDocument();
+    warnSpy.mockRestore();
+  });
+
+  it('sends the pasted local-server token on Connect', async () => {
+    mockConnect.mockResolvedValue(undefined);
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /local run gptme-server/i }));
+    fireEvent.change(screen.getByPlaceholderText('Server token from gptme-server logs'), {
+      target: { value: 'dogfood-65f3-token' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /connect/i }));
+
+    await waitFor(() => {
+      expect(mockConnect).toHaveBeenCalledWith({
+        authToken: 'dogfood-65f3-token',
+        useAuthToken: true,
+      });
+    });
+  });
+
+  it('connects to a remote server during tauri mobile setup', async () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: false,
+      serverStatus: {
+        running: false,
+        port: 5700,
+        port_available: false,
+        manages_local_server: false,
+      },
+    });
+    mockConnect.mockResolvedValue(undefined);
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /remote server/i }));
+    fireEvent.change(screen.getByPlaceholderText('https://bob.example.com'), {
+      target: { value: 'https://bob.example.com/' },
+    });
+    fireEvent.change(screen.getByPlaceholderText('Optional API token'), {
+      target: { value: 'secret-token' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /connect/i }));
+
+    await waitFor(() => {
+      expect(mockConnect).toHaveBeenCalledWith({
+        baseUrl: 'https://bob.example.com',
+        authToken: 'secret-token',
+        useAuthToken: true,
+      });
+    });
+  });
+
+  it('submits remote server form when pressing Enter in the URL field', async () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: false,
+      serverStatus: {
+        running: false,
+        port: 5700,
+        port_available: false,
+        manages_local_server: false,
+      },
+    });
+    mockConnect.mockResolvedValue(undefined);
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /remote server/i }));
+    const urlInput = screen.getByPlaceholderText('https://bob.example.com');
+    fireEvent.change(urlInput, { target: { value: 'https://bob.example.com/' } });
+    fireEvent.keyDown(urlInput, { key: 'Enter' });
+
+    await waitFor(() => {
+      expect(mockConnect).toHaveBeenCalledWith({
+        baseUrl: 'https://bob.example.com',
+        authToken: null,
+        useAuthToken: false,
+      });
+    });
+  });
+
+  it('waits for tauri status before enabling the server mode choice', () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: true,
+      managesLocalServer: null,
+      serverStatus: null,
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+
+    expect(screen.getByRole('button', { name: /monitor checking environment/i })).toBeDisabled();
+  });
+
+  it('saves an API key via the server API and advances to complete', async () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: true,
+      serverStatus: {
+        running: true,
+        port: 5700,
+        port_available: false,
+        manages_local_server: true,
+      },
+    });
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ provider_configured: false }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          models: [
+            {
+              id: 'anthropic/claude-sonnet-4-7',
+              provider: 'anthropic',
+              model: 'claude-sonnet-4-7',
+            },
+          ],
+          recommended: ['anthropic/claude-sonnet-4-7'],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ status: 'ok', env_var: 'ANTHROPIC_API_KEY' }),
+      })
+      .mockRejectedValueOnce(new Error('connection refused'))
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ provider_configured: true }),
+      });
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+    let startAttempts = 0;
+    mockInvokeTauri.mockImplementation(async (cmd: string) => {
+      if (cmd === 'start_server' && startAttempts++ === 0) {
+        throw new Error('Port 5700 is already in use');
+      }
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /monitor local/i }));
+    fireEvent.click(screen.getByRole('button', { name: /connect/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText(/api key/i), { target: { value: 'sk-ant-test-key' } });
+    fireEvent.click(screen.getByRole('button', { name: /save and restart server/i }));
+
+    await waitFor(() => {
+      expect(mockFetch).toHaveBeenCalledWith('http://127.0.0.1:5700/api/v2/user/api-key', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          provider: 'anthropic',
+          api_key: 'sk-ant-test-key',
+          model: 'anthropic/claude-sonnet-4-7',
+        }),
+      });
+    });
+    expect(mockInvokeTauri).toHaveBeenCalledWith('stop_server');
+    expect(mockInvokeTauri).toHaveBeenCalledWith('start_server');
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /you're all set/i })).toBeInTheDocument();
+    });
+  });
+
+  it('saves an API key when pressing Enter in the API key field', async () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: true,
+      serverStatus: {
+        running: true,
+        port: 5700,
+        port_available: false,
+        manages_local_server: true,
+      },
+    });
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ provider_configured: false }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          models: [
+            {
+              id: 'anthropic/claude-sonnet-4-7',
+              provider: 'anthropic',
+              model: 'claude-sonnet-4-7',
+            },
+          ],
+          recommended: ['anthropic/claude-sonnet-4-7'],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ status: 'ok', env_var: 'ANTHROPIC_API_KEY' }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ provider_configured: true }),
+      });
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+    mockInvokeTauri.mockResolvedValue(undefined);
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /monitor local/i }));
+    fireEvent.click(screen.getByRole('button', { name: /connect/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+    });
+
+    const apiKeyInput = screen.getByLabelText(/api key/i);
+    fireEvent.change(apiKeyInput, { target: { value: 'sk-ant-test-key' } });
+    fireEvent.keyDown(apiKeyInput, { key: 'Enter' });
+
+    await waitFor(() => {
+      expect(mockFetch).toHaveBeenCalledWith('http://127.0.0.1:5700/api/v2/user/api-key', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          provider: 'anthropic',
+          api_key: 'sk-ant-test-key',
+          model: 'anthropic/claude-sonnet-4-7',
+        }),
+      });
+    });
+  });
+
+  it('does not submit API key on Enter when the field is empty', async () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: true,
+      serverStatus: {
+        running: true,
+        port: 5700,
+        port_available: false,
+        manages_local_server: true,
+      },
+    });
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ provider_configured: false }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ models: [], recommended: [] }),
+      });
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /monitor local/i }));
+    fireEvent.click(screen.getByRole('button', { name: /connect/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+    });
+
+    const apiKeyInput = screen.getByLabelText(/api key/i);
+    fireEvent.keyDown(apiKeyInput, { key: 'Enter' });
+
+    // No POST to /api/v2/user/api-key should have been made.
+    const calls = mockFetch.mock.calls.map((c) => c[0]);
+    expect(calls).not.toContain('http://127.0.0.1:5700/api/v2/user/api-key');
+  });
+
+  it('shows an error instead of falsely completing when the restarted server never comes back', async () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: true,
+      serverStatus: {
+        running: true,
+        port: 5700,
+        port_available: false,
+        manages_local_server: true,
+      },
+    });
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ provider_configured: false }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          models: [
+            {
+              id: 'anthropic/claude-sonnet-4-7',
+              provider: 'anthropic',
+              model: 'claude-sonnet-4-7',
+            },
+          ],
+          recommended: ['anthropic/claude-sonnet-4-7'],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ status: 'ok', env_var: 'ANTHROPIC_API_KEY' }),
+      })
+      .mockRejectedValue(new Error('connection refused'));
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+    mockInvokeTauri.mockResolvedValue(undefined);
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /monitor local/i }));
+    fireEvent.click(screen.getByRole('button', { name: /connect/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText(/api key/i), { target: { value: 'sk-ant-test-key' } });
+    fireEvent.click(screen.getByRole('button', { name: /save and restart server/i }));
+
+    await waitFor(
+      () => {
+        expect(screen.getByText(/server did not come back in time/i)).toBeInTheDocument();
+      },
+      { timeout: 4000 }
+    );
+    expect(screen.queryByRole('heading', { name: /you're all set/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+  });
+
+  it('surfaces API key save errors without advancing', async () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: true,
+      serverStatus: {
+        running: true,
+        port: 5700,
+        port_available: false,
+        manages_local_server: true,
+      },
+    });
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ provider_configured: false }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          models: [
+            {
+              id: 'anthropic/claude-sonnet-4-7',
+              provider: 'anthropic',
+              model: 'claude-sonnet-4-7',
+            },
+          ],
+          recommended: ['anthropic/claude-sonnet-4-7'],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 500,
+        json: async () => ({ error: 'Failed to write config: permission denied' }),
+      });
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /monitor local/i }));
+    fireEvent.click(screen.getByRole('button', { name: /connect/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText(/api key/i), { target: { value: 'sk-bad' } });
+    fireEvent.click(screen.getByRole('button', { name: /save and restart server/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/permission denied/i)).toBeInTheDocument();
+    });
+    expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+    expect(mockInvokeTauri).not.toHaveBeenCalledWith('stop_server');
+    expect(mockInvokeTauri).not.toHaveBeenCalledWith('start_server');
+  });
+
+  it('rejects an invalid provider key (422) and stays on provider step without restarting server', async () => {
+    // Regression test for https://github.com/gptme/gptme/issues/3545:
+    // Before the fix, the server saved any key without validation and the wizard
+    // advanced to "You're all set!" even with an invalid key. Now the backend
+    // validates the key and returns 422 when the provider rejects it, and the
+    // wizard must stay on the provider step without touching the server.
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: true,
+      serverStatus: {
+        running: true,
+        port: 5700,
+        port_available: false,
+        manages_local_server: true,
+      },
+    });
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ provider_configured: false }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          models: [
+            {
+              id: 'anthropic/claude-sonnet-4-7',
+              provider: 'anthropic',
+              model: 'claude-sonnet-4-7',
+            },
+          ],
+          recommended: ['anthropic/claude-sonnet-4-7'],
+        }),
+      })
+      // The /api/v2/user/api-key endpoint validates the key with the provider.
+      // An invalid key returns 422 Unprocessable Entity (not a 500).
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 422,
+        json: async () => ({ error: 'Invalid API key. Please check your key and try again.' }),
+      });
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /monitor local/i }));
+    fireEvent.click(screen.getByRole('button', { name: /connect/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText(/api key/i), {
+      target: { value: 'sk-ant-invalid-key' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /save and restart server/i }));
+
+    // The error from the backend must be shown inline (not just a toast).
+    await waitFor(() => {
+      expect(screen.getByText(/Invalid API key/i)).toBeInTheDocument();
+    });
+
+    // Pin the *inline* requirement: asserting the text is merely "in the document"
+    // would also pass if the error were rendered only as a toast, so assert both
+    // that no error toast fired and that the message sits in the provider step's
+    // form, next to the save button.
+    expect(toast.error).not.toHaveBeenCalled();
+    const saveButton = screen.getByRole('button', { name: /save and restart server/i });
+    expect(saveButton.parentElement).toContainElement(screen.getByText(/Invalid API key/i));
+
+    // The wizard must NOT advance past the provider step.
+    expect(screen.queryByRole('heading', { name: /you're all set/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+
+    // The server must NOT be restarted — only valid keys should trigger a restart.
+    expect(mockInvokeTauri).not.toHaveBeenCalledWith('stop_server');
+    expect(mockInvokeTauri).not.toHaveBeenCalledWith('start_server');
+  });
+
+  it('surfaces a non-blocking warning when the provider is unreachable', async () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: true,
+      serverStatus: {
+        running: true,
+        port: 5700,
+        port_available: false,
+        manages_local_server: true,
+      },
+    });
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ provider_configured: false }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          models: [
+            {
+              id: 'anthropic/claude-sonnet-4-7',
+              provider: 'anthropic',
+              model: 'claude-sonnet-4-7',
+            },
+          ],
+          recommended: ['anthropic/claude-sonnet-4-7'],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          status: 'ok',
+          env_var: 'ANTHROPIC_API_KEY',
+          warning: 'Request timed out. Please check your network connection.',
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ provider_configured: true }),
+      });
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+    mockInvokeTauri.mockResolvedValue(undefined);
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /monitor local/i }));
+    fireEvent.click(screen.getByRole('button', { name: /connect/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText(/api key/i), { target: { value: 'sk-good' } });
+    fireEvent.click(screen.getByRole('button', { name: /save and restart server/i }));
+
+    await waitFor(() => {
+      expect(toast.warning).toHaveBeenCalledWith(
+        'Request timed out. Please check your network connection.'
+      );
+    });
+    expect(mockInvokeTauri).toHaveBeenCalledWith('stop_server');
+    expect(mockInvokeTauri).toHaveBeenCalledWith('start_server');
+  });
+
+  it('surfaces nested API error objects instead of [object Object]', async () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: true,
+      serverStatus: {
+        running: true,
+        port: 5700,
+        port_available: false,
+        manages_local_server: true,
+      },
+    });
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ provider_configured: false }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          models: [
+            {
+              id: 'openrouter/openai/gpt-4.1',
+              provider: 'openrouter',
+              model: 'openai/gpt-4.1',
+            },
+          ],
+          recommended: ['openrouter/openai/gpt-4.1'],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 502,
+        json: async () => ({ error: { message: 'Cannot retrieve provider settings' } }),
+      });
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /monitor local/i }));
+    fireEvent.click(screen.getByRole('button', { name: /connect/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText(/provider/i), { target: { value: 'openrouter' } });
+    fireEvent.change(screen.getByLabelText(/api key/i), { target: { value: 'sk-or-test-key' } });
+    fireEvent.click(screen.getByRole('button', { name: /save and restart server/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Cannot retrieve provider settings')).toBeInTheDocument();
+    });
+    expect(screen.queryByText('[object Object]')).not.toBeInTheDocument();
+  });
+
+  it('surfaces Tauri invoke object errors instead of [object Object]', async () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: true,
+      serverStatus: {
+        running: true,
+        port: 5700,
+        port_available: false,
+        manages_local_server: true,
+      },
+    });
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ provider_configured: false }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          models: [
+            {
+              id: 'openrouter/openai/gpt-4.1',
+              provider: 'openrouter',
+              model: 'openai/gpt-4.1',
+            },
+          ],
+          recommended: ['openrouter/openai/gpt-4.1'],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ status: 'ok', env_var: 'OPENROUTER_API_KEY' }),
+      });
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+    mockInvokeTauri.mockImplementation(async (cmd: string) => {
+      if (cmd === 'start_server') {
+        throw { message: 'Sidecar error: Failed to execute script' };
+      }
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /monitor local/i }));
+    fireEvent.click(screen.getByRole('button', { name: /connect/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText(/provider/i), { target: { value: 'openrouter' } });
+    fireEvent.change(screen.getByLabelText(/api key/i), { target: { value: 'sk-or-test-key' } });
+    fireEvent.click(screen.getByRole('button', { name: /save and restart server/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Sidecar error: Failed to execute script')).toBeInTheDocument();
+    });
+    expect(screen.queryByText('[object Object]')).not.toBeInTheDocument();
+  });
+});

@@ -1,0 +1,474 @@
+"""Session data models — ToolStatus, ToolExecution, ConversationSession, SessionManager.
+
+Extracted from api_v2_sessions.py to separate data definitions from
+execution logic and Flask route handlers.
+"""
+
+import logging
+import threading
+import uuid
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from ..hooks import HookType, trigger_hook
+from ..lessons.skill_events import SkillPhase, record_skill_phase
+from ..message import Message
+from ..session import BaseSession
+from ..tools import ToolUse
+from .api_v2_common import EventType
+
+if TYPE_CHECKING:
+    from .acp_session_runtime import AcpSessionRuntime
+
+logger = logging.getLogger(__name__)
+
+
+class ToolStatus(Enum):
+    """Status of a tool execution."""
+
+    PENDING = "pending"
+    EXECUTING = "executing"
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
+@dataclass
+class ToolExecution:
+    """Tracks a tool execution."""
+
+    tool_id: str
+    tooluse: ToolUse
+    status: ToolStatus = ToolStatus.PENDING
+    auto_confirm: bool = False
+    started_at: float | None = None
+    branch: str = "main"
+    # Timestamp of the assistant message that requested this tool. Used to
+    # target the correct message when persisting timing data, since by the
+    # time execution completes a later assistant message may already exist
+    # (see _attach_tool_timings in session_step.py).
+    assistant_msg_timestamp: datetime | None = None
+
+
+@dataclass
+class ConversationSession(BaseSession):
+    """Session for a conversation.
+
+    Extends BaseSession with server-specific fields for event streaming,
+    tool execution tracking, and client management.
+
+    Inherited from BaseSession:
+        id: str - Session identifier
+        conversation_id: str | None - Conversation/log identifier
+        active: bool - Whether session is active
+        created_at: datetime - Session creation timestamp
+        last_activity: datetime - Last activity timestamp
+
+    Server-specific fields:
+        generating: bool - Whether LLM is currently generating
+        events: list - Event queue for SSE streaming
+        pending_tools: dict - Tools awaiting confirmation
+        auto_confirm_count: int - Auto-confirm counter
+        clients: set - Connected client IDs
+        event_flag: Event - Threading event for notifications
+    """
+
+    # Server-specific fields (all have defaults, required for dataclass inheritance)
+    generating: bool = False
+    generating_since: datetime | None = (
+        None  # When generation started (for stuck detection)
+    )
+    # Set by an interrupt that actually revokes active work; cleared when a new
+    # user-authorized generation chain is successfully dispatched. Tells tool
+    # workers not to continue the agent loop after their current tool completes.
+    interrupted: bool = False
+    last_error: str | None = None
+    events: list[EventType] = field(default_factory=list)
+    _events_offset: int = 0  # number of events trimmed from front of list
+    pending_tools: dict[str, ToolExecution] = field(default_factory=dict)
+    # Tools that have been popped from pending_tools but not yet written their
+    # results. Used to prevent the continuation step from starting before all
+    # concurrent tool threads have finished writing.
+    _executing_tools: set[str] = field(default_factory=set)
+    auto_confirm_count: int = 0
+    clients: set[str] = field(default_factory=set)
+    event_flag: threading.Event = field(default_factory=threading.Event)
+    # Lock for atomic check-and-set of the generating flag in /step.
+    # Prevents concurrent requests from both reading False before either writes True.
+    step_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # Monotonically increasing generation epoch. Interrupts revoke the current
+    # epoch; successful user dispatches and tool continuations claim a new one.
+    # Tool workers compare their captured epoch before releasing or continuing.
+    step_seq: int = 0
+
+    # Invocation ownership follows this session across generation/tool workers.
+    # Access these fields only while holding step_lock.
+    skill_invocation_ids: set[str] = field(default_factory=set)
+    skill_logdir: Path | None = None
+    skill_branch: str | None = None
+
+    # ACP-backed subprocess session (opt-in via use_acp=True in step request)
+    use_acp: bool = False
+    acp_runtime: "AcpSessionRuntime | None" = field(default=None, repr=False)
+    # Index of the last user message processed through ACP mode.
+    # Prevents duplicate /step calls from re-sending the same user message.
+    acp_last_user_msg_index: int = -1
+
+    # Maximum events to keep in memory per session before trimming.
+    # Each LLM token generates one event, so a 10K-token response = 10K events.
+    # At ~200 bytes/event, 10K events ≈ 2MB. We trim to keep_last when exceeded.
+    _MAX_EVENTS = 10_000
+    _KEEP_EVENTS = 1_000
+
+    def track_skill_turn(
+        self, logdir: Path, branch: str, messages: list[Message]
+    ) -> None:
+        """Own only skill prompts in the latest user turn, never the whole ledger."""
+        invocation_ids: set[str] = set()
+        seen_user = False
+        for msg in reversed(messages):
+            if msg.role == "assistant" and seen_user:
+                break
+            if msg.role == "user":
+                seen_user = True
+                if msg.metadata and (
+                    invocation_id := msg.metadata.get("skill_invocation_id")
+                ):
+                    invocation_ids.add(invocation_id)
+        if self.skill_branch != branch or self.skill_invocation_ids != invocation_ids:
+            self.finish_skill_turn("abandoned")
+        self.skill_logdir = logdir
+        self.skill_branch = branch
+        self.skill_invocation_ids = invocation_ids
+
+    def finish_skill_turn(
+        self, phase: SkillPhase, *, error_type: str | None = None
+    ) -> None:
+        """Record evidence for this owner's invocations; caller holds step_lock."""
+        if self.skill_logdir is not None:
+            for invocation_id in self.skill_invocation_ids:
+                record_skill_phase(
+                    self.skill_logdir, invocation_id, phase, error_type=error_type
+                )
+        self.skill_invocation_ids.clear()
+
+    @property
+    def events_count(self) -> int:
+        """Absolute event count (including trimmed events)."""
+        return self._events_offset + len(self.events)
+
+    def get_events_since(self, abs_index: int) -> list[EventType]:
+        """Get events from an absolute index (accounting for trimmed events)."""
+        rel_index = max(0, abs_index - self._events_offset)
+        return self.events[rel_index:]
+
+    def trim_events(self) -> None:
+        """Trim old events when the list exceeds _MAX_EVENTS.
+
+        Only trims when no clients are connected to avoid breaking
+        in-flight SSE streams that reference absolute indices.
+        """
+        if len(self.events) <= self._MAX_EVENTS or self.clients:
+            return
+        trim_count = len(self.events) - self._KEEP_EVENTS
+        self._events_offset += trim_count
+        self.events = self.events[trim_count:]
+
+
+class SessionManager:
+    """Manages conversation sessions.
+
+    Thread-safe: all access to ``_sessions`` and ``_conversation_sessions``
+    is serialized through ``_lock``.  Long-running side-effects (hook
+    triggers, ACP runtime cleanup) run outside the lock to avoid blocking
+    concurrent readers.
+    """
+
+    _sessions: dict[str, ConversationSession] = {}
+    _conversation_sessions: dict[str, set[str]] = defaultdict(set)
+    # Kept for the process lifetime. Conversation IDs are durable and their
+    # per-ID locks are tiny; retaining them avoids replacing a lock while a
+    # request still holds it after the final session is removed.
+    _conversation_locks: dict[str, threading.RLock] = {}
+    # Slash commands may perform slow LLM/tool work outside the conversation lock.
+    # This reservation keeps generation and mutations from racing that work.
+    _active_commands: set[str] = set()
+    _lock = threading.Lock()
+
+    @classmethod
+    def conversation_lock(cls, conversation_id: str) -> threading.RLock:
+        """Return the lock serializing generation-sensitive conversation work."""
+        with cls._lock:
+            lock = cls._conversation_locks.get(conversation_id)
+            if lock is None:
+                lock = threading.RLock()
+                cls._conversation_locks[conversation_id] = lock
+            return lock
+
+    @classmethod
+    def command_is_active(cls, conversation_id: str) -> bool:
+        """Return whether a synchronous command owns the conversation."""
+        with cls._lock:
+            return conversation_id in cls._active_commands
+
+    @classmethod
+    def start_command(cls, conversation_id: str) -> None:
+        """Reserve a conversation for synchronous command execution."""
+        with cls._lock:
+            cls._active_commands.add(conversation_id)
+
+    @classmethod
+    def finish_command(cls, conversation_id: str) -> None:
+        """Release a synchronous command reservation."""
+        with cls._lock:
+            cls._active_commands.discard(conversation_id)
+        # Evict after releasing _lock: _evict_idle_cost_window takes the
+        # same non-reentrant lock. A live session or a newly started command
+        # makes this a no-op.
+        cls._evict_idle_cost_window(conversation_id, None)
+
+    @classmethod
+    def create_session(cls, conversation_id: str) -> ConversationSession:
+        """Create a new session for a conversation."""
+        session_id = str(uuid.uuid4())
+        session = ConversationSession(id=session_id, conversation_id=conversation_id)
+        with cls._lock:
+            cls._sessions[session_id] = session
+            cls._conversation_sessions[conversation_id].add(session_id)
+        return session
+
+    @classmethod
+    def get_session(cls, session_id: str) -> ConversationSession | None:
+        """Get a session by ID."""
+        with cls._lock:
+            return cls._sessions.get(session_id)
+
+    @classmethod
+    def get_all_sessions(cls) -> list[tuple[str, ConversationSession]]:
+        """Return a snapshot of all (session_id, session) pairs."""
+        with cls._lock:
+            return list(cls._sessions.items())
+
+    @classmethod
+    def get_sessions_for_conversation(
+        cls, conversation_id: str
+    ) -> list[ConversationSession]:
+        """Get all sessions for a conversation."""
+        with cls._lock:
+            return [
+                cls._sessions[sid]
+                for sid in list(cls._conversation_sessions.get(conversation_id, set()))
+                if sid in cls._sessions
+            ]
+
+    @classmethod
+    def conversation_generating(cls, conversation_id: str) -> bool:
+        """Return whether any session for the conversation is generating.
+
+        The ``generating`` flag is session-scoped, but generation writes to the
+        conversation's shared log — so reservation checks must consider all
+        sessions for the conversation, not just the requesting one.
+        """
+        return any(
+            session.generating
+            for session in cls.get_sessions_for_conversation(conversation_id)
+        )
+
+    @classmethod
+    def add_event(cls, conversation_id: str, event: EventType) -> None:
+        """Add an event to all sessions for a conversation."""
+        sessions = cls.get_sessions_for_conversation(conversation_id)
+        for session in sessions:
+            session.events.append(event)
+            session.trim_events()
+            session.touch()
+            session.event_flag.set()
+
+    _STUCK_GENERATING_TIMEOUT_MINUTES = 10
+
+    @classmethod
+    def clean_inactive_sessions(cls, max_age_minutes: int = 60) -> None:
+        """Clean up inactive sessions.
+
+        Also detects sessions stuck in generating=True state: if a session has
+        been generating for longer than _STUCK_GENERATING_TIMEOUT_MINUTES, it is
+        force-cleaned to prevent permanent resource leaks.
+
+        Removal is performed atomically under a single lock acquisition to
+        prevent a TOCTOU race where a concurrent ``/step`` could start
+        generating on a session between the staleness check and its removal.
+        Side-effects (hook triggers, ACP cleanup) run after the lock is
+        released.
+        """
+        now = datetime.now(tz=timezone.utc)
+        cutoff = now - timedelta(minutes=max_age_minutes)
+        stuck_cutoff = now - timedelta(minutes=cls._STUCK_GENERATING_TIMEOUT_MINUTES)
+
+        # Collect post-lock cleanup work, including each session's skill ownership.
+        deferred: list[
+            tuple[str, bool, AcpSessionRuntime | None, ConversationSession]
+        ] = []
+
+        with cls._lock:
+            to_remove: list[str] = []
+            for session_id, session in list(cls._sessions.items()):
+                if session.last_activity < cutoff and not session.generating:
+                    to_remove.append(session_id)
+                elif (
+                    session.generating
+                    and session.generating_since is not None
+                    and session.generating_since < stuck_cutoff
+                ):
+                    logger.warning(
+                        "Force-cleaning stuck session %s (generating since %s, "
+                        "exceeded %d min timeout)",
+                        session_id,
+                        session.generating_since.isoformat(),
+                        cls._STUCK_GENERATING_TIMEOUT_MINUTES,
+                    )
+                    session.generating = False
+                    to_remove.append(session_id)
+
+            # Remove all identified sessions while still holding the lock.
+            for session_id in to_remove:
+                session = cls._sessions[session_id]
+                conversation_id = session.conversation_id
+                if conversation_id is None:
+                    raise ValueError("Server sessions must have conversation_id")
+
+                is_last = (
+                    conversation_id in cls._conversation_sessions
+                    and len(cls._conversation_sessions[conversation_id]) == 1
+                    and session_id in cls._conversation_sessions[conversation_id]
+                )
+
+                if conversation_id in cls._conversation_sessions:
+                    cls._conversation_sessions[conversation_id].discard(session_id)
+                    if not cls._conversation_sessions[conversation_id]:
+                        del cls._conversation_sessions[conversation_id]
+
+                acp_rt = session.acp_runtime
+                del cls._sessions[session_id]
+                deferred.append((conversation_id, is_last, acp_rt, session))
+
+        # Phase 2: outside lock — long-running side-effects
+        for conversation_id, is_last, acp_rt, session in deferred:
+            with session.step_lock:
+                session.finish_skill_turn("abandoned")
+            if is_last:
+                logdir: Path | None = None
+                try:
+                    from ..logmanager import LogManager
+
+                    manager = LogManager.load(conversation_id, lock=True)
+                    logdir = manager.logdir
+                    logger.debug(
+                        "Last session for conversation %s, triggering SESSION_END hook",
+                        conversation_id,
+                    )
+                    if session_end_msgs := trigger_hook(
+                        HookType.SESSION_END,
+                        manager=manager,
+                    ):
+                        for msg in session_end_msgs:
+                            manager.append(msg)
+                except Exception as e:
+                    logger.warning(f"Failed to trigger SESSION_END hook: {e}")
+                cls._evict_idle_cost_window(conversation_id, logdir)
+
+            if acp_rt is not None:
+                from .session_step import close_acp_runtime_bg
+
+                close_acp_runtime_bg(acp_rt)
+
+    @classmethod
+    def remove_session(cls, session_id: str) -> None:
+        """Remove a session.
+
+        Dict mutations happen under ``_lock``; hook triggers and ACP cleanup
+        run after the lock is released to avoid blocking other threads.
+        """
+        # Phase 1: under lock — gather info and remove from dicts
+        with cls._lock:
+            if session_id not in cls._sessions:
+                return
+            session = cls._sessions[session_id]
+            conversation_id = session.conversation_id
+            if conversation_id is None:
+                raise ValueError("Server sessions must have conversation_id")
+
+            is_last_session = (
+                conversation_id in cls._conversation_sessions
+                and len(cls._conversation_sessions[conversation_id]) == 1
+                and session_id in cls._conversation_sessions[conversation_id]
+            )
+
+            if conversation_id in cls._conversation_sessions:
+                cls._conversation_sessions[conversation_id].discard(session_id)
+                if not cls._conversation_sessions[conversation_id]:
+                    del cls._conversation_sessions[conversation_id]
+
+            acp_rt = session.acp_runtime
+            del cls._sessions[session_id]
+
+        # Phase 2: outside lock — long-running side-effects
+        with session.step_lock:
+            session.finish_skill_turn("abandoned")
+        if is_last_session:
+            logdir: Path | None = None
+            try:
+                from ..logmanager import LogManager
+
+                manager = LogManager.load(conversation_id, lock=True)
+                logdir = manager.logdir
+
+                logger.debug(
+                    f"Last session for conversation {conversation_id}, triggering SESSION_END hook"
+                )
+                if session_end_msgs := trigger_hook(
+                    HookType.SESSION_END,
+                    manager=manager,
+                ):
+                    for msg in session_end_msgs:
+                        manager.append(msg)
+            except Exception as e:
+                logger.warning(f"Failed to trigger SESSION_END hook: {e}")
+            cls._evict_idle_cost_window(conversation_id, logdir)
+
+        if acp_rt is not None:
+            from .session_step import close_acp_runtime_bg
+
+            close_acp_runtime_bg(acp_rt)
+
+    @classmethod
+    def _evict_idle_cost_window(cls, conversation_id: str, logdir: Path | None) -> None:
+        """Drop the CostTracker window if no live sessions or commands remain.
+
+        Re-checks under ``_lock`` so a session that connected after last-session
+        teardown started, or a command still running outside the conversation
+        lock, is not evicted.
+        """
+        from ..dirs import get_logs_dir
+        from ..util.cost_tracker import CostTracker, session_id_for_logdir
+
+        # Hold _lock across end_session so create_session cannot insert a
+        # live session into a window we are about to drop. Lock order is
+        # SessionManager._lock then CostTracker._sessions_lock.
+        with cls._lock:
+            if conversation_id in cls._conversation_sessions:
+                return
+            if conversation_id in cls._active_commands:
+                return
+            if logdir is None:
+                logdir = get_logs_dir() / conversation_id
+            CostTracker.end_session(session_id_for_logdir(logdir))
+
+    @classmethod
+    def remove_all_sessions_for_conversation(cls, conversation_id: str) -> None:
+        """Remove all sessions for a conversation."""
+        for session in cls.get_sessions_for_conversation(conversation_id):
+            cls.remove_session(session.id)

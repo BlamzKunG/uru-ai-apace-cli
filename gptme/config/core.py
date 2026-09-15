@@ -1,0 +1,321 @@
+"""Core configuration: Config class, context variables, and accessors.
+
+The Config class aggregates user, project, and chat configurations.
+Context variables provide thread-safe configuration storage.
+"""
+
+import logging
+import os
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
+
+from typing_extensions import Self
+
+from .chat import ChatConfig
+from .models import (
+    MCPConfig,
+    MCPServerConfig,
+    ProjectConfig,
+    ScriptHookConfig,
+    UserConfig,
+)
+from .project import (
+    _config_logged_workspaces,
+    _get_project_config_cached,
+    get_project_config,
+)
+from .user import load_user_config
+
+logger = logging.getLogger(__name__)
+
+ModelSourceKind = Literal["cli", "chat_config", "models.default", "MODEL"]
+
+
+@dataclass()
+class Config:
+    """
+    A complete configuration object, including user and project configurations.
+
+    It is meant to be used to resolve configuration values, not to be passed around everywhere.
+    Care must be taken to avoid this becoming a "god object" passed around loosely, or frequently used as a global.
+    """
+
+    user: UserConfig = field(default_factory=load_user_config)
+    project: ProjectConfig | None = None
+    chat: ChatConfig | None = None
+    # Runtime-only provenance for a model already resolved into chat.model.
+    # The value guard prevents a later explicit model from inheriting stale provenance.
+    _model_source: tuple[ModelSourceKind, str] | None = field(default=None, repr=False)
+
+    @classmethod
+    def from_workspace(cls, workspace: Path) -> Self:
+        """Load the configuration from a workspace directory. Clearing any cache."""
+        _get_project_config_cached.cache_clear()
+        _config_logged_workspaces.clear()
+        return cls(
+            user=load_user_config(),
+            project=get_project_config(workspace),
+        )
+
+    @classmethod
+    def from_logdir(cls, logdir: Path) -> Self:
+        """Load the configuration from a log directory."""
+        chat_config = ChatConfig.from_logdir(logdir)
+        return cls(
+            user=load_user_config(),
+            project=get_project_config(chat_config.workspace),
+            chat=chat_config,
+        )
+
+    def get_script_hooks(self) -> list[ScriptHookConfig]:
+        """Return user and project script hooks in execution order."""
+        hooks = list(self.user.hooks.scripts)
+        if self.project:
+            hooks.extend(self.project.hooks.scripts)
+        return sorted(hooks, key=lambda hook: hook.priority, reverse=True)
+
+    @property
+    def mcp(self) -> MCPConfig:
+        """Get the MCP configuration, merging user and project configurations."""
+        # Override MCP config from project config and chat config if present, merging mcp servers
+        servers: list[MCPServerConfig] = []
+
+        enabled = False
+        auto_start = False
+
+        # merge mcp servers
+        if self.chat and self.chat.mcp:
+            for server in self.chat.mcp.servers:
+                if server.name not in [s.name for s in servers]:
+                    servers.append(server)
+
+        if self.project and self.project.mcp:
+            for server in self.project.mcp.servers:
+                if server.name not in [s.name for s in servers]:
+                    servers.append(server)
+
+        if self.user and self.user.mcp:
+            for server in self.user.mcp.servers:
+                if server.name not in [s.name for s in servers]:
+                    servers.append(server)
+
+        # merge mcp config
+        if self.user and self.user.mcp:
+            enabled = self.user.mcp.enabled
+            auto_start = self.user.mcp.auto_start
+
+        if self.project and self.project.mcp:
+            enabled = self.project.mcp.enabled
+            auto_start = self.project.mcp.auto_start
+
+        if self.chat and self.chat.mcp:
+            enabled = self.chat.mcp.enabled
+            auto_start = self.chat.mcp.auto_start
+
+        mcp = MCPConfig(
+            enabled=enabled,
+            auto_start=auto_start,
+            servers=servers,
+        )
+
+        return mcp
+
+    def get_plugin_config(self) -> tuple[list[Path], list[str] | None]:
+        """Resolve plugin search paths and the enabled allowlist.
+
+        Layers user-level ``[plugins]`` (from ~/.config/gptme/config.toml) with
+        project-level ``[plugins]`` (from gptme.toml). User paths are
+        ``~``/absolute (or expanduser-resolved); project paths resolve against
+        the workspace when relative. Returns ``(paths, enabled)``.
+
+        The ``enabled`` allowlist is the **union** of the user and project lists
+        (empty => ``None``, meaning all discovered plugins are enabled). The
+        union is intentionally restrictive: a global allowlist set by the user
+        also constrains plugins discovered from project paths, so a project
+        cannot silently load plugins the user hasn't opted into. To allow a
+        project's plugins under a user allowlist, add them to either list.
+        """
+        paths: list[Path] = []
+        enabled: list[str] = []
+
+        def _add_path(path: Path) -> None:
+            resolved = path.resolve()
+            if resolved not in {p.resolve() for p in paths}:
+                paths.append(path)
+
+        # User-level plugins. Paths are expanduser-resolved; use absolute or
+        # ``~``-prefixed paths (resolution is independent of the config file
+        # location, which may differ from the default in tests/multi-profile).
+        for path_str in self.user.plugins.paths:
+            _add_path(Path(path_str).expanduser())
+        enabled.extend(self.user.plugins.enabled)
+
+        # Project-level plugins (relative paths resolve against the workspace)
+        if self.project and self.project.plugins:
+            for path_str in self.project.plugins.paths:
+                path = Path(path_str).expanduser()
+                if not path.is_absolute() and self.project._workspace:
+                    path = self.project._workspace / path
+                _add_path(path)
+            enabled.extend(self.project.plugins.enabled)
+
+        # Dedupe enabled, preserving order. Empty => None (all plugins enabled).
+        deduped_enabled = list(dict.fromkeys(enabled))
+        return paths, (deduped_enabled or None)
+
+    def get_env(self, key: str, default: str | None = None) -> str | None:
+        """Gets an environment variable, checks the config file if it's not set in the environment.
+
+        Checks both ``GPTME_<KEY>`` and ``<KEY>`` forms for environment variables,
+        with the prefixed form taking precedence. Config file lookups always use
+        the bare (unprefixed) key.
+        """
+        prefixed = f"GPTME_{key}" if not key.startswith("GPTME_") else key
+        bare = key.removeprefix("GPTME_") if key.startswith("GPTME_") else key
+        return (
+            os.environ.get(prefixed)
+            or os.environ.get(bare)
+            or (self.chat and self.chat.env.get(bare))
+            or (self.project and self.project.env.get(bare))
+            or self.user.env.get(bare)
+            or default
+        )
+
+    def get_env_bool(self, key: str, default: bool | None = None) -> bool | None:
+        if env_value := self.get_env(key):
+            return env_value.lower() in ("1", "true", "yes", "on")
+        return default
+
+    def get_env_required(self, key: str) -> str:
+        """Gets an environment variable, checks the config file if it's not set in the environment.
+
+        Uses the same ``GPTME_`` prefix lookup logic as ``get_env()``.
+        """
+        if val := self.get_env(key):
+            return val
+        raise KeyError(  # pragma: no cover
+            f"Environment variable {key} not set in env or config, see README."
+        )
+
+
+# Context-local storage for config
+# Each context (thread/async task) gets its own independent copy of the configuration
+_config_var: ContextVar[Config | None] = ContextVar("config", default=None)
+
+# Note: Configuration must be initialized in each context that needs it.
+# The first call to get_config() in a context will create a new Config instance.
+# Subsequent calls in the same context will return the same instance.
+
+
+def get_config() -> Config:
+    """Get the current configuration."""
+    config = _config_var.get()
+    if config is None:
+        config = Config()
+        _config_var.set(config)
+    return config
+
+
+def set_config(config: Config):
+    """Set the configuration."""
+    _config_var.set(config)
+
+
+def set_config_from_workspace(workspace: Path):
+    """Set the configuration to use a specific workspace, possibly having a project config."""
+    _config_var.set(Config.from_workspace(workspace=workspace))
+
+
+def reload_config() -> Config:
+    """Reload the configuration files."""
+    config = _config_var.get()
+    # Model provenance is runtime-only state: reloading the config files must not
+    # erase which layer the session's already-resolved model came from.
+    model_source = config._model_source if config is not None else None
+    if config is None:
+        config = Config()
+        _config_var.set(config)
+    elif workspace := (config.project and config.project._workspace):
+        config = Config.from_workspace(workspace=workspace)
+        _config_var.set(config)
+    else:
+        config = Config()
+        _config_var.set(config)
+    config._model_source = model_source
+
+    # Clear tools cache so MCP tools are recreated with new config
+    from gptme.tools import clear_tools  # fmt: skip
+
+    clear_tools()
+
+    assert config
+    return config
+
+
+def resolve_model_source(
+    config: Config,
+    cli_model: str | None = None,
+    chat_model: str | None = None,
+) -> tuple[str, ModelSourceKind] | None:
+    """Resolve the chat model, and which layer it came from.
+
+    Layers are ordered by specificity, mirroring :meth:`Config.get_env`: a value
+    set for this invocation beats one set for the conversation, which beats one
+    set for the project, which beats global user config.
+
+    1. ``--model``/``-m`` CLI flag
+    2. the model saved with the conversation
+    3. ``GPTME_MODEL``/``MODEL`` in the process environment
+    4. ``[env].MODEL`` in the chat config
+    5. ``[env].MODEL`` in the project's ``gptme.toml``
+    6. ``[models].default`` in the user config
+    7. ``[env].MODEL`` in the user config
+
+    ``[models].default`` sits among the *global* layers, so it still beats
+    ``[env].MODEL`` in the same user config (its documented role as the formal
+    alternative to that variable) without overriding a shell variable or a
+    per-project ``gptme.toml``.
+
+    The ``MODEL`` layers are always read through :meth:`Config.get_env`, which
+    owns that lookup order; this function only splits it around
+    ``[models].default``. Layers 3-5 are the ones that outrank the default, so
+    they are probed by masking out the layers below them, and everything left
+    over (layer 7) comes from the plain ``get_env`` call.
+
+    Returns ``None`` when no model is configured, leaving the caller to
+    auto-detect from available credentials.
+    """
+    if cli_model:
+        return cli_model, "cli"
+    if chat_model:
+        return chat_model, "chat_config"
+
+    # Layers above [models].default. get_env owns the MODEL lookup order, so ask
+    # it once; a value that came *only* from the user config ranks below the
+    # default and is handled further down.
+    env_model = config.get_env("MODEL")
+    if env_model:
+        user_env_model = config.user.env.get("MODEL")
+        if env_model != user_env_model:
+            return env_model, "MODEL"
+        # Same string as the user config's [env].MODEL. A more specific layer
+        # may hold that string too, and those still outrank [models].default.
+        if env_model in (
+            os.environ.get("GPTME_MODEL"),
+            os.environ.get("MODEL"),
+        ):
+            return env_model, "MODEL"
+        if config.chat and config.chat.env.get("MODEL") == env_model:
+            return env_model, "MODEL"
+        if config.project and config.project.env.get("MODEL") == env_model:
+            return env_model, "MODEL"
+
+    if default := config.user.models.default:
+        return default, "models.default"
+
+    # Layer 7: [env].MODEL in the user config.
+    if env_model:
+        return env_model, "MODEL"
+    return None

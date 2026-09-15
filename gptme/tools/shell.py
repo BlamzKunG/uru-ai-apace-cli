@@ -1,0 +1,3168 @@
+"""
+The assistant can execute shell commands with bash by outputting code blocks with `shell` as the language.
+
+Configuration:
+    GPTME_SHELL_TIMEOUT: Environment variable to configure command timeout (set before starting gptme)
+
+        - Set to a number (e.g., 30) for timeout in seconds
+        - Set to 0 to disable timeout
+        - Invalid values default to 1200 seconds (20 minutes)
+        - If not set, defaults to 1200 seconds (20 minutes)
+
+    GPTME_SHELL_MEMORY_LIMIT: Optional per-shell address-space ceiling (POSIX only,
+        off by default). Accepts a plain byte count or a binary suffix (e.g.
+        "512M", "1G"). Applies to the persistent shell and any command it runs
+        via `ulimit -v`, so a runaway build fails with an allocation error
+        instead of stalling the session.
+
+    GPTME_SHELL_TRUNC_PRE_TOKENS / GPTME_SHELL_TRUNC_POST_TOKENS: Override the
+    head/tail token budget for stdout truncation. Defaults: 2000 / 8000.
+    GPTME_SHELL_TRUNC_STDERR_PRE_TOKENS / GPTME_SHELL_TRUNC_STDERR_POST_TOKENS:
+    Same overrides for stderr. Defaults: 2000 / 2000. Lowering these makes the
+    truncation path fire on smaller outputs, which surfaces savings telemetry
+    in `context-savings.jsonl` and the `/context` command. Invalid values fall
+    back to defaults.
+
+    GPTME_SHELL_MAX_OUTPUT_BYTES: Hard cap on the total bytes (stdout + stderr
+        combined) captured into the in-process buffer before the subprocess is
+        killed and the output is truncated. Accepts a plain byte count or a
+        binary suffix (e.g. "32M", "1G"). Default: 32 MiB. This prevents a
+        runaway ``cat`` of a multi-GiB file from exhausting gptme's RSS.
+        The process receives SIGTERM then SIGKILL; the returned output contains
+        a ``[output truncated at N MiB, process killed]`` marker. Token-level
+        truncation (GPTME_SHELL_TRUNC_*) is applied on top as a second stage.
+"""
+
+import atexit
+import codecs
+import logging
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Generator
+from contextvars import ContextVar
+from pathlib import Path
+from typing import IO, TYPE_CHECKING
+
+from ..message import Message
+from ..sandbox import (
+    SandboxConfig,
+    _parse_size,
+    apply_memory_limit,
+    build_env,
+    verify_memory_limit,
+    wrap_shell_cmd,
+)
+from ..util import get_installed_programs
+from ..util.ask_execute import execute_with_confirmation
+from ..util.context import md_codeblock
+from ..util.context_savings import record_context_savings
+from ..util.output_storage import save_large_output
+from ..util.tokens import get_tokenizer, len_tokens
+from .base import (
+    Parameter,
+    ToolSpec,
+    ToolUse,
+)
+from .pruner import plan_tool_output_prune
+from .shell_background import (
+    background_job_completion_hook,
+    execute_jobs_command,
+    execute_kill_command,
+    execute_output_command,
+    execute_wait_command,
+    get_background_job,
+)
+from .shell_background import (
+    list_background_jobs as list_background_jobs,
+)
+from .shell_background import (
+    reset_background_jobs as reset_background_jobs,
+)
+from .shell_background import (
+    start_background_job as start_background_job,
+)
+from .shell_validation import (
+    _find_first_unquoted_pipe,
+    check_with_shellcheck,
+    is_allowlisted,
+    is_denylisted,
+    shell_allowlist_hook,
+)
+
+if TYPE_CHECKING:
+    from tree_sitter import Node
+
+    from ..hooks import StopPropagation
+    from ..logmanager import LogManager
+
+_is_windows = os.name == "nt"
+
+# ANSI escape sequence pattern for stripping terminal formatting
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def _parse_bash(source: bytes) -> "Node":
+    """Parse lazily so shell grammar loading does not affect CLI startup."""
+    import tree_sitter_bash
+    from tree_sitter import Language, Parser
+
+    return Parser(Language(tree_sitter_bash.language())).parse(source).root_node
+
+
+def _redirect_background_stdin(command: str) -> str:
+    """Redirect stdin before unquoted ``&`` operators in a shell command.
+
+    Appending ``< /dev/null`` to a command ending in ``&`` creates a separate
+    null command after the background operator. The background process keeps
+    the persistent shell's stdin and can consume subsequent tool commands. If
+    the asynchronous list has a trailing foreground command, redirect that
+    command as well.
+    """
+    source = command.encode("utf-8")
+    root = _parse_bash(source)
+    if root.has_error:
+        return _redirect_background_stdin_bashlex(command)
+
+    positions: list[int] = []
+    pending = [root]
+    while pending:
+        node = pending.pop()
+        if (
+            node.type == "&"
+            and not node.is_named
+            and node.parent is not None
+            and node.parent.type != "binary_expression"
+        ):
+            positions.append(node.start_byte)
+        pending.extend(node.children)
+
+    for position in sorted(positions, reverse=True):
+        source = source[:position].rstrip() + b" < /dev/null " + source[position:]
+    if positions and not source.rstrip().endswith(b"&"):
+        source += b" < /dev/null"
+    return source.decode("utf-8")
+
+
+def _redirect_background_stdin_bashlex(command: str) -> str:
+    """Legacy fallback for background operators in tree-sitter grammar gaps."""
+    import bashlex
+
+    try:
+        nodes = bashlex.parse(_mask_time_keyword(command))
+    except Exception:
+        # split_commands handles unsupported and invalid syntax separately.
+        # Avoid rewriting syntax we cannot classify confidently here.
+        return command
+
+    positions: list[int] = []
+
+    def _collect_operators(value: object) -> None:
+        if isinstance(value, list):
+            for item in value:
+                _collect_operators(item)
+            return
+        if not hasattr(value, "kind"):
+            return
+        position = getattr(value, "pos", None)
+        if (
+            getattr(value, "kind", None) == "operator"
+            and getattr(value, "op", None) == "&"
+            and isinstance(position, tuple)
+        ):
+            positions.append(position[0])
+        for child in vars(value).values():
+            _collect_operators(child)
+
+    _collect_operators(nodes)
+
+    for position in reversed(positions):
+        command = command[:position].rstrip() + " < /dev/null " + command[position:]
+    if positions and not command.rstrip().endswith("&"):
+        command += " < /dev/null"
+    return command
+
+
+def strip_ansi_codes(text: str) -> str:
+    """Strip ANSI escape sequences from text."""
+    return ANSI_ESCAPE_PATTERN.sub("", text)
+
+
+def trim_blank_lines(text: str) -> str:
+    """Trim only leading and trailing blank (whitespace-only) lines.
+
+    Interior blank lines are kept. Unlike str.strip(), the first/last
+    contentful lines are returned verbatim, so indentation (e.g. from
+    sed/head/tail of indented code) is preserved.
+    """
+    lines = text.split("\n")
+    start, end = 0, len(lines)
+    while start < end and not lines[start].strip():
+        start += 1
+    while end > start and not lines[end - 1].strip():
+        end -= 1
+    return "\n".join(lines[start:end])
+
+
+logger = logging.getLogger(__name__)
+
+# Default token budgets for shell output truncation (overridable via env vars).
+_TRUNC_PRE_TOKENS_DEFAULT = 2000
+_TRUNC_POST_TOKENS_DEFAULT = 8000
+_TRUNC_STDERR_PRE_TOKENS_DEFAULT = 2000
+_TRUNC_STDERR_POST_TOKENS_DEFAULT = 2000
+_GIT_LOG_PREVIEW_LINES = 20
+_GH_LIST_PREVIEW_LINES = 10
+
+# Default byte cap for captured subprocess output (32 MiB). Configurable via
+# GPTME_SHELL_MAX_OUTPUT_BYTES (or [env] SHELL_MAX_OUTPUT_BYTES in config.toml).
+_DEFAULT_MAX_OUTPUT_BYTES = 32 * 1024 * 1024  # 32 MiB
+
+
+candidates = (
+    # platform-specific
+    "brew",
+    "apt-get",
+    "pacman",
+    # common and useful
+    "ffmpeg",
+    "magick",
+    "pandoc",
+    "git",
+    "docker",
+    "rg",
+    "ag",
+    "ast-grep",
+    "hyperfine",
+)
+
+
+shell_programs_str = "\n".join(
+    f"- {prog}" for prog in sorted(get_installed_programs(candidates))
+)
+is_macos = sys.platform == "darwin"
+
+
+instructions = f"""
+The given command will be executed in a stateful bash shell.
+The shell tool will respond with the output of the execution.
+
+These programs are available, among others:
+{shell_programs_str}
+
+### When to use the shell
+
+Use the shell to inspect the workspace, search files, check git state, or run
+existing commands and tests. Prefer the repo over answering from memory.
+
+### Background Jobs
+
+Set `background: true` on a structured shell call to run its whole script as a
+conversation-owned process. The call returns a job ID immediately and completion
+is reported automatically. Exact `jobs`, `output <id> [--new]`, `wait <id>
+[timeout]`, and `kill <id>` calls manage matching harness jobs; otherwise Bash
+owns those commands. Use this for dev servers and long builds.
+""".strip()
+
+instructions_format: dict[str, str] = {}
+
+
+def examples(tool_format):
+    ls_output = "file1.txt\nfile2.txt"
+    ls_files_output = "README.md\nmain.py"
+    vue_output = "> npx\n> create-vue\n\nVue.js - The Progressive JavaScript Framework\n\nScaffolding project in ./fancy-project..."
+    return f"""
+> User: list the current directory
+> Assistant: To list the files in the current directory, use `ls`:
+{ToolUse("shell", [], "ls").to_output(tool_format)}
+> System: Ran command: `ls`
+{md_codeblock("stdout", ls_output)}
+
+#### The assistant can learn context by exploring the filesystem
+
+> User: learn about the project
+> Assistant: Lets start by checking the files
+{ToolUse("shell", [], "git ls-files").to_output(tool_format)}
+> System:
+{md_codeblock("stdout", ls_files_output)}
+> Assistant: Now lets check the README
+{ToolUse("shell", [], "cat README.md").to_output(tool_format)}
+> System:
+{md_codeblock("stdout", "(contents of README.md)")}
+> Assistant: Now we check main.py
+{ToolUse("shell", [], "cat main.py").to_output(tool_format)}
+> System:
+{md_codeblock("stdout", "(contents of main.py)")}
+> Assistant: The project is...
+
+
+#### Create vue project
+
+> User: Create a new vue project with typescript and pinia named fancy-project
+> Assistant: Sure! Let's create a new vue project with TypeScript and Pinia named fancy-project:
+{
+        ToolUse(
+            "shell",
+            [],
+            "npm init vue@latest fancy-project --yes -- --typescript --pinia",
+        ).to_output(tool_format)
+    }
+> System:
+{md_codeblock("stdout", vue_output)}
+
+#### Proper quoting for complex content
+
+> User: add a comment with backticks and special characters
+> Assistant: When passing complex content with special characters, use single quotes to prevent shell interpretation:
+{
+        ToolUse(
+            "shell",
+            [],
+            "echo 'Content with `backticks` and $variables that should not be interpreted' > example.txt",
+        ).to_output(tool_format)
+    }
+
+#### Background jobs for long-running commands
+
+> User: start a dev server
+> Assistant: I'll start the dev server as a background job so it doesn't block:
+{ToolUse("shell", [], "bg npm run dev").to_output(tool_format)}
+> System: Started background job **#1**: `npm run dev`
+>
+> Use these commands to manage it:
+> - `jobs` - List all background jobs
+> - `output 1` - Show output from job #1
+> - `wait 1 60s` - Wait up to 60 seconds for job #1
+> - `kill 1` - Terminate job #1
+
+> User: check the server output
+> Assistant: Let me check the output from the background job:
+{ToolUse("shell", [], "output 1").to_output(tool_format)}
+> System: **Job #1** - Running (45.2s)
+> Command: `npm run dev`
+>
+> ```stdout
+> > project@1.0.0 dev
+> > vite
+>
+> VITE v5.0.0  ready in 300 ms
+>
+> ➜  Local:   http://localhost:5173/
+> ```
+
+> User: stop the server
+> Assistant: I'll terminate the background job:
+{ToolUse("shell", [], "kill 1").to_output(tool_format)}
+> System: Terminated job #1: `npm run dev`
+""".strip()
+
+
+def _get_memory_limit() -> int | None:
+    """Read the opt-in shell memory ceiling in bytes, or None if unset.
+
+    Knob is ``GPTME_SHELL_MEMORY_LIMIT`` (env) or ``[env] SHELL_MEMORY_LIMIT``
+    (config.toml). The value is a byte count or a binary-suffixed size (e.g.
+    ``"512M"``). Unparseable values and unenforceable limits (e.g. the value
+    exceeds the system hard ulimit) are both logged as warnings and treated as
+    unset so a misconfiguration never breaks the shell tool entirely.
+
+    POSIX-only: returns None on Windows because ``ulimit -v`` is not available.
+    """
+    if _is_windows:
+        return None  # ulimit -v is a POSIX-only bash builtin; skip silently
+    from ..config import get_config  # deferred: avoid import cycle
+
+    raw = get_config().get_env("SHELL_MEMORY_LIMIT")
+    if not raw:
+        return None
+    try:
+        limit = _parse_size(str(raw))
+    except (ValueError, AttributeError):
+        logger.warning(
+            "Ignoring invalid GPTME_SHELL_MEMORY_LIMIT=%r (expected e.g. '512M')",
+            raw,
+        )
+        return None
+    try:
+        verify_memory_limit(limit)
+    except ValueError as exc:
+        # Treat an unenforceable limit as unset rather than crashing the shell.
+        # A misconfigured ceiling (e.g. 4G on a system with a 2G hard ulimit)
+        # should not prevent every shell command from working.
+        logger.warning(
+            "GPTME_SHELL_MEMORY_LIMIT=%r cannot be enforced on this system "
+            "(running without memory ceiling). Details: %s",
+            raw,
+            exc,
+        )
+        return None
+    return limit
+
+
+def _get_max_output_bytes() -> int:
+    """Read the output byte cap in bytes (default 32 MiB).
+
+    Knob is ``GPTME_SHELL_MAX_OUTPUT_BYTES`` (env) or
+    ``[env] SHELL_MAX_OUTPUT_BYTES`` (config.toml). Accepts a plain byte count
+    or a binary-suffixed size (e.g. ``"32M"``). Unparseable or non-positive
+    values fall back to the 32 MiB default so a misconfiguration never disables
+    the cap entirely.
+    """
+    from ..config import get_config  # deferred: avoid import cycle
+
+    raw = get_config().get_env("SHELL_MAX_OUTPUT_BYTES")
+    if not raw:
+        return _DEFAULT_MAX_OUTPUT_BYTES
+    try:
+        limit = _parse_size(str(raw))
+    except (ValueError, AttributeError):
+        logger.warning(
+            "Ignoring invalid GPTME_SHELL_MAX_OUTPUT_BYTES=%r (expected e.g. '32M')",
+            raw,
+        )
+        return _DEFAULT_MAX_OUTPUT_BYTES
+    if limit <= 0:
+        logger.warning(
+            "GPTME_SHELL_MAX_OUTPUT_BYTES=%r is not positive; using default 32 MiB",
+            raw,
+        )
+        return _DEFAULT_MAX_OUTPUT_BYTES
+    return limit
+
+
+def _strip_shell_return_marker(raw: bytes, delimiter: str) -> bytes:
+    """Strip the shell-injected return marker from a raw output chunk.
+
+    The marker is echoed on a single line — ``ReturnCode:$? <delimiter>`` —
+    immediately after the command. We remove it (and anything after it) from
+    the byte-accounting stream, but only when both ``ReturnCode:`` and the
+    delimiter share the *same* line. Command output that merely contains
+    ``ReturnCode:`` and later ``END_OF_COMMAND_OUTPUT`` on separate lines must
+    be counted in full, otherwise such output can undercount and bypass the
+    output byte cap (Greptile P1: marker text bypasses cap).
+    """
+    delimiter_pos = raw.rfind(b"ReturnCode:")
+    if delimiter_pos >= 0:
+        rest = raw[delimiter_pos:]
+        line_end = rest.find(b"\n")
+        delimiter_line = rest if line_end < 0 else rest[:line_end]
+        if delimiter.encode() in delimiter_line:
+            return raw[:delimiter_pos]
+    return raw
+
+
+def _wait_readable(fds: list[int], timeout: float | None) -> list[int]:
+    """Return the subset of `fds` that are readable, waiting up to `timeout` seconds.
+
+    Uses `poll()` rather than `select()`. `select()` is backed by `fd_set`, which
+    cannot represent a descriptor >= FD_SETSIZE (1024) and raises
+    `ValueError: filedescriptor out of range in select()` instead of degrading.
+    Long-lived processes and highly parallel test runs (`pytest -n 16`) routinely
+    push descriptors past that line. `poll()` has no such ceiling.
+    """
+    poller = select.poll()
+    for fd in fds:
+        # POLLHUP/POLLERR are reported regardless of the requested mask, so EOF
+        # still wakes the poll — matching select(), which reports EOF as readable.
+        poller.register(fd, select.POLLIN)
+    # select() takes seconds (None == block forever); poll() takes integer
+    # milliseconds (negative == block forever). Round positive sub-millisecond
+    # waits up so they do not become busy-spinning non-blocking polls.
+    timeout_ms = (
+        -1 if timeout is None else max(0 if timeout == 0 else 1, int(timeout * 1000))
+    )
+    return [fd for fd, _event in poller.poll(timeout_ms)]
+
+
+class ShellSession:
+    process: subprocess.Popen
+    stdout_fd: int
+    stderr_fd: int
+    delimiter: str
+    start_marker: str  # Fix for Issue #408: Add start marker to prevent output mixing
+    _cwd: str | None  # Workspace directory for this session (thread-safe)
+    _memory_limit: int | None  # Address-space ceiling in bytes (None = off)
+
+    def __init__(self, cwd: str | None = None) -> None:
+        self._cwd = cwd
+        self._memory_limit = _get_memory_limit()
+        self._init()
+
+        # close on exit
+        atexit.register(self.close)
+
+    def get_cwd(self) -> Path:
+        """Return the persistent shell's effective working directory."""
+        return Path(self._cwd or os.getcwd())
+
+    def _set_cwd(self, cwd: str) -> None:
+        """Synchronize the tracked cwd with the persistent shell."""
+        if not cwd:
+            logger.warning("pwd returned an empty working directory")
+            return
+        changed = cwd != self._cwd
+        self._cwd = cwd
+        # Preserve historical CLI behavior without process-wide chdir calls
+        # after every command; server conversations use context-local cwd.
+        if changed and get_workspace_cwd() is None:
+            os.chdir(cwd)
+
+    def _invalidate_cwd(self) -> None:
+        """Forget cwd state when a command ends without a trusted marker."""
+        self._cwd = None
+
+    def _init(self):
+        # Choose shell and process group settings based on platform
+        if _is_windows:
+            shell_cmd = ["bash"]  # Expect MSYS2/Git Bash on Windows
+            popen_kwargs: dict = {}  # No start_new_session on Windows
+        else:
+            shell_cmd = ["bash"]
+            popen_kwargs = {
+                "start_new_session": True,  # Create new process group for proper signal handling
+            }
+            if self._memory_limit is not None:
+                shell_cmd = apply_memory_limit(shell_cmd, self._memory_limit)
+
+        # Apply sandbox wrapper if GPTME_SANDBOX is set
+        sandbox = SandboxConfig.from_env(
+            workspace=Path(self._cwd) if self._cwd else None
+        )
+        if sandbox.enabled:
+            available, msg = sandbox.check_available()
+            if not available:
+                raise RuntimeError(
+                    f"GPTME_SANDBOX={sandbox.backend!r} was requested but the"
+                    f" backend is not available: {msg}. Either install the"
+                    f" sandbox tool or unset GPTME_SANDBOX."
+                )
+            shell_cmd = wrap_shell_cmd(sandbox, shell_cmd)
+            logger.info("Sandboxed shell: %s", " ".join(shell_cmd))
+        sandbox_env = build_env(
+            sandbox
+        )  # None if sandbox disabled → inherit os.environ
+
+        self.process = subprocess.Popen(
+            shell_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,  # Unbuffered
+            universal_newlines=True,
+            cwd=self._cwd,  # Use explicit workspace dir (thread-safe)
+            env=sandbox_env,  # None → inherit; dict → sanitized env
+            **popen_kwargs,
+        )
+        assert self.process.stdout is not None
+        assert self.process.stderr is not None
+        self.stdout_fd = self.process.stdout.fileno()
+        self.stderr_fd = self.process.stderr.fileno()
+        self.delimiter = "END_OF_COMMAND_OUTPUT"
+        self.start_marker = "START_OF_COMMAND_OUTPUT"
+
+        # set GIT_PAGER=cat
+        self.run("export PAGER=")
+        self.run("export GH_PAGER=")
+        self.run("export GIT_PAGER=cat")
+        # prevent editors from opening (they can break terminal state)
+        self.run("export EDITOR=true")
+        self.run("export GIT_EDITOR=true")
+        self.run("export VISUAL=true")
+        # make Python output unbuffered by default for better UX
+        self.run("export PYTHONUNBUFFERED=1")
+
+    def run(
+        self, code: str, output=True, timeout: float | None = None
+    ) -> tuple[int | None, str, str]:
+        """Runs a command in the shell and returns the output."""
+        commands = split_commands(code)
+        res_code: int | None = None
+        res_stdout, res_stderr = "", ""
+        for cmd in commands:
+            res_cur = self._run(cmd, output=output, timeout=timeout)
+            res_code = res_cur[0]
+            res_stdout += res_cur[1]
+            res_stderr += res_cur[2]
+            if res_code in (-124, -125):
+                # The shell process was killed before its cwd marker could be
+                # parsed. Restart() uses the tracked cwd, so clear it first:
+                # the next shell must start at the process cwd rather than an
+                # unverified pre-command directory.
+                self._invalidate_cwd()
+            if res_code != 0:
+                return res_code, res_stdout, res_stderr
+        return res_code, res_stdout, res_stderr
+
+    def _needs_tty(self, command: str) -> bool:
+        """Check if a command needs a TTY (e.g. sudo password prompt) and we're interactive."""
+        return any(self._command_needs_tty(cmd) for cmd in split_commands(command))
+
+    def _command_needs_tty(self, command: str) -> bool:
+        """Check whether one command is routed through the interactive TTY path."""
+        if _is_windows:
+            return False  # No /dev/tty on Windows
+        if not sys.stdin.isatty():
+            return False
+        if SandboxConfig.from_env().enabled:
+            # _run_with_tty launches a separate host process, outside the persistent
+            # sandbox. Keep sandboxed commands on the isolated shell instead.
+            return False
+        # Check for sudo without -S (stdin password) or -n (non-interactive)
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            return False
+        # Find sudo in the command (may be preceded by env vars)
+        for i, part in enumerate(parts):
+            if "=" in part:
+                continue  # Skip env var assignments
+            if part == "sudo":
+                # Check if -S or -n flags are present (they disable TTY need)
+                # Also handle combined short flags like -Sn, -nS, -uS
+                remaining = parts[i + 1 :]
+                flags = [p for p in remaining if p.startswith("-")]
+                for flag in flags:
+                    if flag in ("--stdin", "--non-interactive"):
+                        return False
+                    # Check combined short flags (e.g. -Sn, -nS, -uS)
+                    if flag.startswith("-") and not flag.startswith("--"):
+                        chars = flag[1:]
+                        if "S" in chars or "n" in chars:
+                            return False
+                return True
+            break  # First non-env-var token is not sudo
+        return False
+
+    def _run_with_tty(
+        self, command: str, output: bool = True, timeout: float | None = None
+    ) -> tuple[int | None, str, str]:
+        """Run a command with /dev/tty as stdin for interactive password prompts (e.g. sudo).
+
+        Used for commands like sudo that need a real terminal to prompt for passwords.
+        Runs as a separate subprocess in the current working directory.
+        """
+        logger.debug(f"Shell: Running with TTY stdin: {command[:200]}")
+        try:
+            tty_stdin = open("/dev/tty", "rb")
+        except OSError:
+            # /dev/tty is unavailable (CI, non-TTY container, etc.).  Don't fall
+            # back to _run_pipe: that uses the persistent bash session, so shell
+            # builtins like 'exit' would kill the session and deadlock the
+            # delimiter-read loop.  Instead keep spawning a fresh subprocess (which
+            # is what this method does) but with /dev/null as stdin — sudo won't
+            # be able to prompt for a password, but non-interactive commands work
+            # correctly and the pipe EOF is always clean.
+            logger.warning("Could not open /dev/tty, using /dev/null as stdin")
+            tty_stdin = open("/dev/null", "rb")
+
+        try:
+            # Inherit session env overrides so sudo commands behave consistently
+            # (e.g. no pager, consistent EDITOR) with commands run via _run_pipe
+            session_env = os.environ.copy()
+            session_env.update(
+                {
+                    "PAGER": "",
+                    "GH_PAGER": "",
+                    "GIT_PAGER": "cat",
+                    "EDITOR": "true",
+                    "GIT_EDITOR": "true",
+                    "VISUAL": "true",
+                    "PYTHONUNBUFFERED": "1",
+                }
+            )
+            shell_cmd = ["bash", "-c", command]
+            if self._memory_limit is not None:
+                shell_cmd = apply_memory_limit(shell_cmd, self._memory_limit)
+            proc = subprocess.Popen(
+                shell_cmd,
+                stdin=tty_stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                # Don't use start_new_session=True here - we need to inherit the
+                # controlling terminal so sudo can prompt for passwords
+                cwd=self._cwd or os.getcwd(),
+                env=session_env,
+            )
+            assert proc.stdout is not None and proc.stderr is not None
+
+            from queue import Empty, Queue
+
+            # Use threads to drain stdout and stderr concurrently — the same
+            # mechanism as communicate(), but with real-time printing as data
+            # arrives. A blocking read on a quiet stream is unreliable when
+            # /dev/tty is the child's stdin and the process produces no output
+            # before exiting. Poll via `_wait_readable` (not `select.select`)
+            # so descriptors >= FD_SETSIZE still work; see gptme/gptme#3715.
+            data_q: Queue[tuple[str, bytes] | None] = Queue()
+
+            stop_readers = threading.Event()
+
+            def _reader(src: IO[bytes], tag: str) -> None:
+                fd = src.fileno()
+                try:
+                    while True:
+                        readable = _wait_readable([fd], 0.1)
+                        if not readable:
+                            if stop_readers.is_set():
+                                break
+                            continue
+                        chunk = os.read(fd, 2**16)
+                        if not chunk:
+                            break
+                        data_q.put((tag, chunk))
+                except OSError:
+                    if not stop_readers.is_set():
+                        raise
+                finally:
+                    data_q.put(None)  # one sentinel per thread
+
+            t_out = threading.Thread(
+                target=_reader, args=(proc.stdout, "out"), daemon=True
+            )
+            t_err = threading.Thread(
+                target=_reader, args=(proc.stderr, "err"), daemon=True
+            )
+            t_out.start()
+            t_err.start()
+
+            stdout_chunks: list[str] = []
+            stderr_chunks: list[str] = []
+            decoders = {
+                "out": codecs.getincrementaldecoder("utf-8")(errors="replace"),
+                "err": codecs.getincrementaldecoder("utf-8")(errors="replace"),
+            }
+            sentinels = 0
+            exited_at: float | None = None
+            exit_code: int | None = None
+            start_time = time.monotonic() if timeout is not None else None
+
+            def append_text(tag: str, text: str) -> None:
+                if not text:
+                    return
+                if tag == "out":
+                    stdout_chunks.append(text)
+                    if output:
+                        print(text, end="", file=sys.stdout)
+                else:
+                    stderr_chunks.append(text)
+                    if output:
+                        print(text, end="", file=sys.stderr)
+
+            def consume(item: tuple[str, bytes] | None) -> None:
+                nonlocal sentinels
+                if item is None:
+                    sentinels += 1
+                    return
+
+                tag, chunk = item
+                append_text(tag, decoders[tag].decode(chunk))
+
+            def finish_readers(*, stop: bool = False) -> None:
+                if stop:
+                    stop_readers.set()
+                    t_out.join(timeout=0.2)
+                    t_err.join(timeout=0.2)
+                    # Drain data already enqueued by the threads before closing
+                    # pipes, so we don't discard output they buffered during the
+                    # grace window.
+                    while True:
+                        try:
+                            consume(data_q.get_nowait())
+                        except Empty:
+                            break
+                    if proc.stdout is not None:
+                        proc.stdout.close()
+                    if proc.stderr is not None:
+                        proc.stderr.close()
+                t_out.join()
+                t_err.join()
+                while True:
+                    try:
+                        consume(data_q.get_nowait())
+                    except Empty:
+                        break
+                for tag, decoder in decoders.items():
+                    append_text(tag, decoder.decode(b"", final=True))
+
+            try:
+                while sentinels < 2 or exit_code is None:
+                    # The caller timeout applies while the direct child is running.
+                    # Once it exits, use the separate post-exit grace below: a
+                    # descendant retaining the pipes must not turn success into -124.
+                    if (
+                        exit_code is None
+                        and timeout is not None
+                        and start_time is not None
+                    ):
+                        elapsed = time.monotonic() - start_time
+                        if elapsed >= timeout:
+                            polled = proc.poll()
+                            if polled is None:
+                                proc.kill()
+                                proc.wait()
+                                finish_readers(stop=True)
+                                return (
+                                    -124,
+                                    trim_blank_lines("".join(stdout_chunks)),
+                                    trim_blank_lines("".join(stderr_chunks)),
+                                )
+                            # Child exited just before the deadline; honour
+                            # the real exit code rather than returning -124.
+                            exit_code = polled
+                            exited_at = time.monotonic()
+                            continue
+                        get_timeout = min(0.05, timeout - elapsed)
+                    else:
+                        get_timeout = 0.05
+
+                    try:
+                        consume(data_q.get(timeout=get_timeout))
+                    except Empty:
+                        pass
+
+                    if exit_code is None:
+                        polled = proc.poll()
+                        if polled is not None:
+                            exit_code = polled
+                            exited_at = time.monotonic()
+                    elif exited_at is not None and time.monotonic() - exited_at >= 1.0:
+                        # Bound the total post-exit drain time: a background
+                        # descendant may retain and continuously write to a pipe.
+                        stop_readers.set()
+                        break
+            except KeyboardInterrupt:
+                print()
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+                finish_readers(stop=True)
+                partial_stdout = trim_blank_lines("".join(stdout_chunks))
+                partial_stderr = trim_blank_lines("".join(stderr_chunks))
+                raise KeyboardInterrupt((partial_stdout, partial_stderr)) from None
+
+            if exit_code is None:
+                exit_code = proc.wait()
+            # A background descendant may retain the pipes. Signal the readers
+            # after the grace; each reader still consumes one final readable
+            # chunk so data already buffered in the pipe is not discarded.
+            finish_readers(stop=sentinels < 2)
+        finally:
+            tty_stdin.close()
+
+        return (
+            exit_code,
+            trim_blank_lines("".join(stdout_chunks)),
+            trim_blank_lines("".join(stderr_chunks)),
+        )
+
+    def _run(
+        self, command: str, output=True, tries=0, timeout: float | None = None
+    ) -> tuple[int | None, str, str]:
+        # Use TTY-based execution for interactive sudo commands
+        if self._needs_tty(command):
+            return self._run_with_tty(command, output=output, timeout=timeout)
+        return self._run_pipe(command, output=output, tries=tries, timeout=timeout)
+
+    def _run_pipe(
+        self, command: str, output=True, tries=0, timeout: float | None = None
+    ) -> tuple[int | None, str, str]:
+        assert self.process.stdin
+
+        # Diagnostic logging for Issue #408: Log command start
+        logger.debug(f"Shell: Running command: {command[:200]}")
+
+        # Redirect stdin to /dev/null to prevent commands from inheriting bash's pipe stdin
+        # Use shlex to properly parse commands and respect quotes
+        # Only add for commands that don't already redirect stdin
+        try:
+            command_parts = list(
+                shlex.shlex(command, posix=True, punctuation_chars=True)
+            )
+
+            # Check if there's already stdin redirection
+            has_stdin_redirect = (
+                "<" in command_parts or "<<" in command_parts or "<<<" in command_parts
+            )
+
+            # For pipelines, redirect stdin for the first command only
+            if "|" in command_parts and not has_stdin_redirect:
+                # Find first unquoted pipe in original command
+                # We can't use shlex.join() because it quotes shell operators like 2>&1
+                try:
+                    pipe_pos = _find_first_unquoted_pipe(command)
+                    if pipe_pos is not None and pipe_pos > 0:
+                        first_cmd = command[:pipe_pos].rstrip()
+                        rest = command[pipe_pos + 1 :].lstrip()
+                        command = f"{first_cmd} < /dev/null | {rest}"
+                except Exception as e:
+                    # Fallback to raw command if parsing fails
+                    logger.warning(f"Failed to parse pipe in command '{command}': {e}")
+            elif not has_stdin_redirect and "|" not in command_parts:
+                # Redirect background commands before ``&`` so they cannot
+                # consume future input sent to the persistent shell.
+                redirected = _redirect_background_stdin(command)
+                command = (
+                    redirected if redirected != command else command + " < /dev/null"
+                )
+        except ValueError as e:
+            logger.warning(f"Failed shlex parsing command, using raw command: {e}")
+
+        # Issue #408: Drain any leftover stderr from previous commands BEFORE sending new command
+        # This ensures we don't mix stderr from previous commands with the current one
+        if _is_windows:
+            # Windows: use non-blocking read to drain stderr
+            try:
+                os.set_blocking(self.stderr_fd, False)
+                while True:
+                    try:
+                        pre_drain_data = os.read(self.stderr_fd, 2**16).decode(
+                            "utf-8", errors="replace"
+                        )
+                        if not pre_drain_data:
+                            break
+                        if pre_drain_data.strip():
+                            logger.debug(
+                                f"Shell: Pre-command stderr drain: {pre_drain_data[:80]}"
+                            )
+                    except BlockingIOError:
+                        break
+                os.set_blocking(self.stderr_fd, True)
+            except OSError:
+                pass
+        else:
+            assert select is not None
+            while True:
+                pre_drain_rlist = _wait_readable([self.stderr_fd], 0.05)
+                if not pre_drain_rlist:
+                    break
+                pre_drain_data = os.read(self.stderr_fd, 2**16).decode(
+                    "utf-8", errors="replace"
+                )
+                if not pre_drain_data:
+                    break
+                # Discard leftover stderr from previous commands
+                if pre_drain_data.strip():
+                    logger.debug(
+                        f"Shell: Pre-command stderr drain: {pre_drain_data[:80]}"
+                    )
+
+        # Generate per-command markers so command output cannot spoof the
+        # control record parsed below (Issue #408).
+        cmd_id = f"{time.time_ns()}"
+        start_marker_pattern = f"{self.start_marker}_{cmd_id}"
+        delimiter_pattern = f"{self.delimiter}_{cmd_id}"
+
+        # Reset errexit after each block so that `set -e` set by the user does
+        # not persist to later blocks. 41% of shell timeouts involve errexit
+        # left on from a prior command. When errexit causes a failure the shell
+        # process dies and is restarted, so we only need to clear it on the
+        # success path.
+        full_command = f"echo {start_marker_pattern}\n"  # Start marker first
+        full_command += f"{command}\n"
+        # Capture the status before querying the physical cwd. ``$PWD`` is a
+        # mutable variable and therefore cannot be trusted for validation. Hex
+        # gives arbitrary valid path bytes a portable, single-line encoding.
+        full_command += (
+            "__gptme_rc=$?; __gptme_pwd=$(pwd -P | od -An -v -tx1 | "
+            "tr -d ' \n'); __gptme_pwd=${__gptme_pwd%0a}; printf "
+            f'"ReturnCode:%s PWDHEX:%s {delimiter_pattern}\\n" '
+            '"$__gptme_rc" "$__gptme_pwd"\n'
+        )
+        full_command += "builtin set +e\n"
+        try:
+            self.process.stdin.write(full_command)
+        except BrokenPipeError:
+            # process has died
+            if tries == 0:
+                # log warning and restart, once
+                logger.warning("Warning: shell process died, restarting")
+                self.restart()
+                return self._run_pipe(
+                    command, output=output, tries=tries + 1, timeout=timeout
+                )
+            raise
+
+        self.process.stdin.flush()
+
+        # Issue #408: Track whether we've seen the start marker for this command
+        seen_start_marker = False
+
+        stdout: list[str] = []
+        stderr: list[str] = []
+        return_code: int | None = None
+        start_time = time.time() if timeout else None
+        max_output_bytes = _get_max_output_bytes()
+
+        if _is_windows:
+            return self._read_output_windows(
+                command,
+                output,
+                stdout,
+                stderr,
+                return_code,
+                seen_start_marker,
+                start_marker_pattern,
+                delimiter_pattern,
+                start_time,
+                timeout,
+                max_output_bytes,
+            )
+        return self._read_output_unix(
+            command,
+            output,
+            stdout,
+            stderr,
+            return_code,
+            seen_start_marker,
+            start_marker_pattern,
+            delimiter_pattern,
+            start_time,
+            timeout,
+            max_output_bytes,
+        )
+
+    def _read_output_windows(
+        self,
+        command: str,
+        output: bool,
+        stdout: list[str],
+        stderr: list[str],
+        return_code: int | None,
+        seen_start_marker: bool,
+        start_marker_pattern: str,
+        delimiter_pattern: str,
+        start_time: float | None,
+        timeout: float | None,
+        max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
+    ) -> tuple[int | None, str, str]:
+        """Read command output on Windows using threads with non-blocking I/O."""
+        from queue import Empty, Queue
+
+        stdout_queue: Queue[str] = Queue()
+        stderr_queue: Queue[str] = Queue()
+        stop_event = threading.Event()
+
+        # Shared byte counter so the producer threads stop enqueueing once the
+        # cap is reached — otherwise a fast-output command can buffer unbounded
+        # data in the queues ahead of the consumer (Greptile P1). Bytes, not
+        # decoded characters, so multibyte UTF-8 cannot exceed the cap 3-4x.
+        cap_state = {"bytes": 0, "over": False}
+        cap_lock = threading.Lock()
+
+        # Track the start marker for the stdout producer so it does not count
+        # the shell-injected START_OF_COMMAND_OUTPUT line (and any pre-marker
+        # output) against the cap.  Mirrors the Unix path's marker exclusion.
+        # Use a list so the closure can mutate it from the producer thread.
+        _producer_seen_start = [False]
+
+        def read_stream(fd: int, queue: Queue[str]) -> None:
+            try:
+                os.set_blocking(fd, False)
+            except OSError:
+                pass
+            while not stop_event.is_set() and not cap_state["over"]:
+                try:
+                    raw = os.read(fd, 2**16)
+                    if not raw:
+                        break
+                    data = raw.decode("utf-8", errors="replace")
+
+                    # Exclude shell protocol markers from byte accounting on
+                    # stdout (mirrors the Unix path).  Pre-marker bytes (e.g.
+                    # leftover output from a prior command, the start-marker
+                    # line itself) are not counted so a command whose real
+                    # output is exactly max_output_bytes does not trip the cap
+                    # on Windows when Unix would not (bob-ai-review P2).
+                    if fd == self.stdout_fd:
+                        countable = raw
+                        if not _producer_seen_start[0]:
+                            if start_marker_pattern in data:
+                                _producer_seen_start[0] = True
+                                raw_marker = start_marker_pattern.encode()
+                                marker_pos = countable.find(raw_marker)
+                                if marker_pos >= 0:
+                                    nl_pos = countable.find(b"\n", marker_pos)
+                                    countable = (
+                                        countable[nl_pos + 1 :] if nl_pos >= 0 else b""
+                                    )
+                            else:
+                                countable = b""  # pre-marker; not user output
+                        countable = _strip_shell_return_marker(
+                            countable, self.delimiter
+                        )
+                        bytes_to_count = len(countable)
+                    else:
+                        bytes_to_count = len(raw)
+
+                    with cap_lock:
+                        cap_state["bytes"] += bytes_to_count
+                        over = cap_state["bytes"] > max_output_bytes
+                        if over:
+                            # Flag the cap BEFORE enqueueing the chunk so the
+                            # consumer cannot dequeue an over-cap chunk that
+                            # carries the delimiter while `over` is still
+                            # False and return the real code (Greptile P1 /
+                            # bob-ai-review P1 race).
+                            cap_state["over"] = True
+                    queue.put(data)
+                    if over:
+                        # Stop producing more data; the consumer detects the
+                        # cap and performs the kill + marker.
+                        break
+                except BlockingIOError:
+                    time.sleep(0.01)
+                except OSError:
+                    break
+
+        t_stdout = threading.Thread(
+            target=read_stream, args=(self.stdout_fd, stdout_queue), daemon=True
+        )
+        t_stderr = threading.Thread(
+            target=read_stream, args=(self.stderr_fd, stderr_queue), daemon=True
+        )
+        t_stdout.start()
+        t_stderr.start()
+
+        re_returncode = re.compile(r"ReturnCode:(\d+)")
+
+        try:
+            while not stop_event.is_set():
+                # Check timeout
+                if timeout and start_time:
+                    elapsed = time.time() - start_time
+                    if elapsed >= timeout:
+                        logger.info(f"Command timed out after {timeout} seconds")
+                        self._terminate_process()
+                        stop_event.set()
+                        return (
+                            -124,
+                            trim_blank_lines("".join(stdout)),
+                            trim_blank_lines("".join(stderr)),
+                        )
+
+                # Drain stdout queue
+                try:
+                    data = stdout_queue.get(timeout=0.1)
+                    # Check the cap at the chunk level, before the delimiter
+                    # branch, so a chunk that both exceeds the cap and carries
+                    # the delimiter cannot bypass the cap (Greptile P1).
+                    if cap_state["over"]:
+                        cap_mib = max_output_bytes / (1024 * 1024)
+                        trunc_msg = (
+                            f"\n[output truncated at {cap_mib:.0f} MiB,"
+                            f" process killed]\n"
+                        )
+                        stdout.append(trunc_msg)
+                        if output:
+                            print(trunc_msg, end="", file=sys.stdout)
+                        logger.warning(
+                            "Shell output cap (%d MiB) exceeded; killing process",
+                            int(cap_mib),
+                        )
+                        self._terminate_process()
+                        stop_event.set()
+                        return (
+                            -125,
+                            trim_blank_lines("".join(stdout)),
+                            trim_blank_lines("".join(stderr)),
+                        )
+                    lines = data.splitlines(keepends=True)
+                    for line in lines:
+                        if not seen_start_marker:
+                            if start_marker_pattern in line:
+                                seen_start_marker = True
+                                logger.debug(
+                                    f"Shell: Start marker detected: {start_marker_pattern[:50]}"
+                                )
+                            else:
+                                if line.strip():
+                                    logger.debug(
+                                        f"Shell: Discarding pre-marker output: {line[:80]}"
+                                    )
+                            continue
+
+                        if "ReturnCode:" in line and delimiter_pattern in line:
+                            # Extract any command output that precedes the
+                            # delimiter on the same line.  This happens when
+                            # command output lacks a trailing newline (e.g.
+                            # printf "yes", echo -n "data").
+                            # Use rfind to get the LAST "ReturnCode:" occurrence,
+                            # which is always the shell-injected marker (not
+                            # command output that itself contains "ReturnCode:").
+                            rc_pos = line.rfind("ReturnCode:")
+                            if rc_pos > 0:
+                                prefix = line[:rc_pos]
+                                stdout.append(prefix)
+                                if output:
+                                    print(prefix, end="", file=sys.stdout)
+
+                            logger.debug(
+                                f"Shell: Delimiter detected in line: {line.strip()[:200]}"
+                            )
+                            # Use findall+last to avoid matching "ReturnCode:N"
+                            # in command output that precedes the marker.
+                            rc_matches = re_returncode.findall(line)
+                            if rc_matches:
+                                return_code = int(rc_matches[-1])
+                            cwd_match = re.search(
+                                rf" PWDHEX:([0-9a-f]*) {re.escape(delimiter_pattern)}",
+                                line[rc_pos:],
+                            )
+                            if cwd_match:
+                                self._set_cwd(
+                                    bytes.fromhex(cwd_match.group(1)).decode(
+                                        errors="surrogateescape"
+                                    )
+                                )
+
+                            # Drain remaining stderr
+                            stop_event.set()
+                            time.sleep(0.05)
+                            while not stderr_queue.empty():
+                                try:
+                                    err_data = stderr_queue.get_nowait()
+                                    stderr.append(err_data)
+                                    if output:
+                                        print(err_data, end="", file=sys.stderr)
+                                except Empty:
+                                    break
+                            # If the cap was tripped (producer set the flag) we
+                            # must not return the real code — enforce the cap
+                            # (bob-ai-review P1 ordering race).
+                            if cap_state["over"]:
+                                cap_mib = max_output_bytes / (1024 * 1024)
+                                trunc_msg = (
+                                    f"\n[output truncated at {cap_mib:.0f} MiB,"
+                                    f" process killed]\n"
+                                )
+                                stdout.append(trunc_msg)
+                                if output:
+                                    print(trunc_msg, end="", file=sys.stdout)
+                                logger.warning(
+                                    "Shell output cap (%d MiB) exceeded;"
+                                    " killing process",
+                                    int(cap_mib),
+                                )
+                                self._terminate_process()
+                                stop_event.set()
+                                return (
+                                    -125,
+                                    trim_blank_lines("".join(stdout)),
+                                    trim_blank_lines("".join(stderr)),
+                                )
+                            return (
+                                return_code,
+                                trim_blank_lines("".join(stdout)),
+                                trim_blank_lines("".join(stderr)),
+                            )
+
+                        stdout.append(line)
+                        if output:
+                            print(line, end="", file=sys.stdout)
+                        if cap_state["over"]:
+                            cap_mib = max_output_bytes / (1024 * 1024)
+                            trunc_msg = (
+                                f"\n[output truncated at {cap_mib:.0f} MiB,"
+                                f" process killed]\n"
+                            )
+                            stdout.append(trunc_msg)
+                            if output:
+                                print(trunc_msg, end="", file=sys.stdout)
+                            logger.warning(
+                                "Shell output cap (%d MiB) exceeded; killing process",
+                                int(cap_mib),
+                            )
+                            self._terminate_process()
+                            stop_event.set()
+                            return (
+                                -125,
+                                trim_blank_lines("".join(stdout)),
+                                trim_blank_lines("".join(stderr)),
+                            )
+                except Empty:
+                    pass
+
+                # Drain stderr queue
+                try:
+                    data = stderr_queue.get_nowait()
+                    if cap_state["over"]:
+                        # Marker is always appended to stdout (consistent with
+                        # the Unix path and documented behavior).
+                        cap_mib = max_output_bytes / (1024 * 1024)
+                        trunc_msg = (
+                            f"\n[output truncated at {cap_mib:.0f} MiB,"
+                            f" process killed]\n"
+                        )
+                        stdout.append(trunc_msg)
+                        if output:
+                            print(trunc_msg, end="", file=sys.stdout)
+                        logger.warning(
+                            "Shell output cap (%d MiB) exceeded; killing process",
+                            int(cap_mib),
+                        )
+                        self._terminate_process()
+                        stop_event.set()
+                        return (
+                            -125,
+                            trim_blank_lines("".join(stdout)),
+                            trim_blank_lines("".join(stderr)),
+                        )
+                    lines = data.splitlines(keepends=True)
+                    for line in lines:
+                        stderr.append(line)
+                        if output:
+                            print(line, end="", file=sys.stderr)
+                        # Marker is always appended to stdout (consistent with the
+                        # Unix path and documented behavior), even when the cap
+                        # was tripped by a stderr line.
+                        if cap_state["over"]:
+                            cap_mib = max_output_bytes / (1024 * 1024)
+                            trunc_msg = (
+                                f"\n[output truncated at {cap_mib:.0f} MiB,"
+                                f" process killed]\n"
+                            )
+                            stdout.append(trunc_msg)
+                            if output:
+                                print(trunc_msg, end="", file=sys.stdout)
+                            logger.warning(
+                                "Shell output cap (%d MiB) exceeded; killing process",
+                                int(cap_mib),
+                            )
+                            self._terminate_process()
+                            stop_event.set()
+                            return (
+                                -125,
+                                trim_blank_lines("".join(stdout)),
+                                trim_blank_lines("".join(stderr)),
+                            )
+                except Empty:
+                    pass
+
+                # Either pipe reached EOF before the protocol delimiter.
+                # Unix recovers on a single-fd EOF. Waiting for both Windows
+                # reader threads to die hangs commands that close only one
+                # stream (`exec 1>&-`) until GPTME_SHELL_TIMEOUT.
+                if (not t_stdout.is_alive()) or (not t_stderr.is_alive()):
+
+                    def _drain_win_queues() -> None:
+                        while True:
+                            try:
+                                leftover = stdout_queue.get_nowait()
+                            except Empty:
+                                break
+                            stdout.append(leftover)
+                            if output:
+                                print(leftover, end="", file=sys.stdout)
+                        while True:
+                            try:
+                                leftover = stderr_queue.get_nowait()
+                            except Empty:
+                                break
+                            stderr.append(leftover)
+                            if output:
+                                print(leftover, end="", file=sys.stderr)
+
+                    _drain_win_queues()
+                    if cap_state["over"]:
+                        cap_mib = max_output_bytes / (1024 * 1024)
+                        trunc_msg = (
+                            f"\n[output truncated at {cap_mib:.0f} MiB,"
+                            f" process killed]\n"
+                        )
+                        stdout.append(trunc_msg)
+                        if output:
+                            print(trunc_msg, end="", file=sys.stdout)
+                        logger.warning(
+                            "Shell output cap (%d MiB) exceeded; killing process",
+                            int(cap_mib),
+                        )
+                        self._terminate_process()
+                        stop_event.set()
+                        return (
+                            -125,
+                            trim_blank_lines("".join(stdout)),
+                            trim_blank_lines("".join(stderr)),
+                        )
+
+                    # Stop the remaining reader before restart/teardown so it
+                    # cannot race on fds the recovery path is about to replace.
+                    stop_event.set()
+                    t_stdout.join(timeout=0.5)
+                    t_stderr.join(timeout=0.5)
+                    _drain_win_queues()
+
+                    try:
+                        self.process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        self._terminate_process()
+                        try:
+                            self.process.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            logger.warning(
+                                "Shell process did not exit after termination"
+                            )
+                            stderr.append(
+                                "\n[gptme] The command closed the persistent shell "
+                                "output pipes. The old shell was terminated but "
+                                "could not be reaped, so it was not replaced; "
+                                "this shell session is unusable.\n"
+                            )
+                            return (
+                                -1,
+                                trim_blank_lines("".join(stdout)),
+                                trim_blank_lines("".join(stderr)),
+                            )
+                    return self._handle_shell_exit(
+                        stdout,
+                        stderr,
+                        output,
+                        max_output_bytes,
+                        cap_state["bytes"],
+                    )
+
+        except KeyboardInterrupt:
+            print()
+            logger.info("Process interrupted during output reading")
+            partial_stdout = trim_blank_lines("".join(stdout))
+            partial_stderr = trim_blank_lines("".join(stderr))
+            raise KeyboardInterrupt((partial_stdout, partial_stderr)) from None
+        finally:
+            stop_event.set()
+            t_stdout.join(timeout=0.5)
+            t_stderr.join(timeout=0.5)
+
+        # Fallback: if we get here without finding delimiter, return what we have
+        return (
+            return_code,
+            trim_blank_lines("".join(stdout)),
+            trim_blank_lines("".join(stderr)),
+        )
+
+    def _read_output_unix(
+        self,
+        command: str,
+        output: bool,
+        stdout: list[str],
+        stderr: list[str],
+        return_code: int | None,
+        seen_start_marker: bool,
+        start_marker_pattern: str,
+        delimiter_pattern: str,
+        start_time: float | None,
+        timeout: float | None,
+        max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
+    ) -> tuple[int | None, str, str]:
+        """Read command output on Unix using select()."""
+        assert select is not None
+        captured_bytes = 0
+        try:
+            while True:
+                # Calculate remaining timeout
+                select_timeout = None
+                if timeout and start_time:
+                    elapsed = time.time() - start_time
+                    if elapsed >= timeout:
+                        # Timeout exceeded
+                        logger.info(f"Command timed out after {timeout} seconds")
+                        # Terminate the entire process group (bash + all child processes)
+                        try:
+                            pgid = os.getpgid(self.process.pid)
+                            os.killpg(pgid, signal.SIGTERM)
+                            time.sleep(0.1)  # Give it a moment to terminate
+                            if self.process.poll() is None:
+                                os.killpg(pgid, signal.SIGKILL)
+                        except Exception as e:
+                            logger.warning(f"Error terminating timed-out process: {e}")
+
+                        partial_stdout = trim_blank_lines("".join(stdout))
+                        partial_stderr = trim_blank_lines("".join(stderr))
+                        return (
+                            -124,
+                            partial_stdout,
+                            partial_stderr,
+                        )  # Use timeout exit code (124)
+
+                    select_timeout = min(
+                        1.0, timeout - elapsed
+                    )  # Check at least every second
+
+                rlist = _wait_readable([self.stdout_fd, self.stderr_fd], select_timeout)
+
+                # Handle timeout in select
+                if not rlist and timeout and start_time:
+                    continue  # Will be caught by timeout check above
+
+                for fd in rlist:
+                    assert fd in [self.stdout_fd, self.stderr_fd]
+                    # We use a higher value, because there is a bug which leads to
+                    # spaces at the boundary
+                    # 2**12 = 4096
+                    # 2**16 = 65536
+                    raw = os.read(fd, 2**16)
+                    if not raw:
+                        # EOF on either output pipe means this persistent shell
+                        # can no longer execute the protocol safely. Drain the
+                        # other pipe within the same byte cap, then restart.
+                        captured_bytes = self._drain_closed_shell_pipes(
+                            stdout,
+                            stderr,
+                            output,
+                            max_output_bytes,
+                            captured_bytes,
+                        )
+                        if captured_bytes > max_output_bytes:
+                            return self._kill_for_byte_cap(
+                                stdout, stderr, output, max_output_bytes
+                            )
+                        try:
+                            self.process.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            self._terminate_process()
+                            try:
+                                self.process.wait(timeout=1.0)
+                            except subprocess.TimeoutExpired:
+                                logger.warning(
+                                    "Shell process did not exit after termination"
+                                )
+                                captured_bytes = self._drain_closed_shell_pipes(
+                                    stdout,
+                                    stderr,
+                                    output,
+                                    max_output_bytes,
+                                    captured_bytes,
+                                )
+                                if captured_bytes > max_output_bytes:
+                                    return self._kill_for_byte_cap(
+                                        stdout, stderr, output, max_output_bytes
+                                    )
+                                stderr.append(
+                                    "\n[gptme] The command closed a persistent shell "
+                                    "output pipe. The old shell was terminated "
+                                    "but could not be reaped, so it was not "
+                                    "replaced; this shell session is unusable.\n"
+                                )
+                                return (
+                                    -1,
+                                    trim_blank_lines("".join(stdout)),
+                                    trim_blank_lines("".join(stderr)),
+                                )
+                            captured_bytes = self._drain_closed_shell_pipes(
+                                stdout,
+                                stderr,
+                                output,
+                                max_output_bytes,
+                                captured_bytes,
+                            )
+                            if captured_bytes > max_output_bytes:
+                                return self._kill_for_byte_cap(
+                                    stdout, stderr, output, max_output_bytes
+                                )
+                            self.restart()
+                            stderr.append(
+                                "\n[gptme] The command closed a persistent shell "
+                                "output pipe, so a fresh shell was started; cwd, "
+                                "variables and `&` jobs from the old shell are "
+                                "gone.\n"
+                            )
+                            return (
+                                -1,
+                                trim_blank_lines("".join(stdout)),
+                                trim_blank_lines("".join(stderr)),
+                            )
+                        return self._handle_shell_exit(
+                            stdout,
+                            stderr,
+                            output,
+                            max_output_bytes,
+                            captured_bytes,
+                        )
+                    data = raw.decode("utf-8", errors="replace")
+                    lines = data.splitlines(keepends=True)
+                    re_returncode = re.compile(r"ReturnCode:(\d+)")
+
+                    # Count raw subprocess output bytes, excluding the shell's
+                    # injected start/return markers. A command just below the cap
+                    # must not be killed merely because its delimiter shares the
+                    # final read chunk (bob-ai-review P2).
+                    captured_raw = raw
+                    if fd == self.stdout_fd:
+                        marker_bytes = start_marker_pattern.encode()
+                        marker_pos = captured_raw.find(marker_bytes)
+                        if not seen_start_marker and marker_pos >= 0:
+                            marker_end = captured_raw.find(b"\n", marker_pos)
+                            captured_raw = (
+                                captured_raw[marker_end + 1 :]
+                                if marker_end >= 0
+                                else b""
+                            )
+                        captured_raw = _strip_shell_return_marker(
+                            captured_raw, self.delimiter
+                        )
+                    captured_bytes += len(captured_raw)
+
+                    for line in lines:
+                        # Issue #408: Skip stdout until we see the start marker
+                        # Only apply to stdout - stderr should pass through unfiltered
+                        if fd == self.stdout_fd and not seen_start_marker:
+                            if start_marker_pattern in line:
+                                seen_start_marker = True
+                                logger.debug(
+                                    f"Shell: Start marker detected: "
+                                    f"{start_marker_pattern[:50]}"
+                                )
+                            else:
+                                # Discard output before start marker (leftover
+                                # from previous commands)
+                                if line.strip():  # Only log non-empty lines
+                                    logger.debug(
+                                        f"Shell: Discarding pre-marker output: "
+                                        f"{line[:80]}"
+                                    )
+                            continue
+
+                        if "ReturnCode:" in line and delimiter_pattern in line:
+                            # Extract any command output that precedes the
+                            # delimiter on the same line.  This happens when
+                            # command output lacks a trailing newline (e.g.
+                            # printf "yes", echo -n "data").
+                            # Use rfind to get the LAST "ReturnCode:" occurrence,
+                            # which is always the shell-injected marker (not
+                            # command output that itself contains "ReturnCode:").
+                            rc_pos = line.rfind("ReturnCode:")
+                            if rc_pos > 0:
+                                prefix = line[:rc_pos]
+                                stdout.append(prefix)
+                                if output:
+                                    print(prefix, end="", file=sys.stdout)
+
+                            # Diagnostic logging for Issue #408
+                            logger.debug(
+                                f"Shell: Delimiter detected in line: "
+                                f"{line.strip()[:200]}"
+                            )
+
+                            # Capture last stdout before delimiter
+                            if stdout:
+                                last_lines = stdout[-3:] if len(stdout) >= 3 else stdout
+                                last_stdout = "".join(last_lines).strip()[:300]
+                                logger.debug(
+                                    f"Shell: Last stdout before delimiter: "
+                                    f"{last_stdout}"
+                                )
+
+                            # Use findall+last to avoid matching "ReturnCode:N"
+                            # in command output that precedes the marker.
+                            rc_matches = re_returncode.findall(line)
+                            if rc_matches:
+                                return_code = int(rc_matches[-1])
+                            cwd_match = re.search(
+                                rf" PWDHEX:([0-9a-f]*) {re.escape(delimiter_pattern)}",
+                                line[rc_pos:],
+                            )
+                            if cwd_match:
+                                self._set_cwd(
+                                    bytes.fromhex(cwd_match.group(1)).decode(
+                                        errors="surrogateescape"
+                                    )
+                                )
+
+                            # If the byte cap was already exceeded in this chunk
+                            # (delimiter line present), do not return the real
+                            # code — enforce the cap (Greptile P1 race).
+                            if captured_bytes > max_output_bytes:
+                                return self._kill_for_byte_cap(
+                                    stdout, stderr, output, max_output_bytes
+                                )
+
+                            # Issue #408: Drain any remaining stderr before
+                            # returning. Use multiple attempts to ensure stderr
+                            # has time to arrive from bash. Bound the drain by
+                            # the byte cap as well — a command that floods
+                            # stderr after signalling completion must not
+                            # bypass the cap (bob-ai-review P1).
+                            drain_empty_count = 0
+                            while (
+                                drain_empty_count < 2
+                                and captured_bytes <= max_output_bytes
+                            ):
+                                drain_rlist = _wait_readable([self.stderr_fd], 0.1)
+                                if not drain_rlist:
+                                    drain_empty_count += 1
+                                    continue
+                                drain_raw = os.read(self.stderr_fd, 2**16)
+                                if not drain_raw:
+                                    drain_empty_count += 1
+                                    continue
+                                drain_empty_count = 0
+                                captured_bytes += len(drain_raw)
+                                drain_data = drain_raw.decode("utf-8", errors="replace")
+                                stderr.append(drain_data)
+                                if output:
+                                    print(drain_data, end="", file=sys.stderr)
+                            if captured_bytes > max_output_bytes:
+                                return self._kill_for_byte_cap(
+                                    stdout, stderr, output, max_output_bytes
+                                )
+                            return (
+                                return_code,
+                                trim_blank_lines("".join(stdout)),
+                                trim_blank_lines("".join(stderr)),
+                            )
+                        if fd == self.stdout_fd:
+                            stdout.append(line)
+                            if output:
+                                print(line, end="", file=sys.stdout)
+                        elif fd == self.stderr_fd:
+                            stderr.append(line)
+                            if output:
+                                print(line, end="", file=sys.stderr)
+
+                        if captured_bytes > max_output_bytes:
+                            return self._kill_for_byte_cap(
+                                stdout, stderr, output, max_output_bytes
+                            )
+
+                    # A chunk containing only pre-marker output takes the
+                    # ``continue`` path above for every line. Enforce the byte
+                    # cap here too instead of waiting for another read chunk.
+                    if not seen_start_marker and captured_bytes > max_output_bytes:
+                        return self._kill_for_byte_cap(
+                            stdout, stderr, output, max_output_bytes
+                        )
+        except KeyboardInterrupt:
+            # Clear line after ^C to avoid leaving a hanging line
+            print()
+            # Handle interrupt at the source - return partial output and re-raise
+            logger.info("Process interrupted during output reading")
+            partial_stdout = trim_blank_lines("".join(stdout))
+            partial_stderr = trim_blank_lines("".join(stderr))
+            raise KeyboardInterrupt((partial_stdout, partial_stderr)) from None
+
+    def _drain_closed_shell_pipes(
+        self,
+        stdout: list[str],
+        stderr: list[str],
+        output: bool,
+        max_output_bytes: int,
+        captured_bytes: int,
+    ) -> int:
+        """Drain both pipes after EOF without bypassing the output byte cap."""
+        open_fds = {self.stdout_fd, self.stderr_fd}
+        deadline = time.monotonic() + 1.0
+        while (
+            open_fds
+            and captured_bytes <= max_output_bytes
+            and time.monotonic() < deadline
+        ):
+            readable = (
+                list(open_fds) if _is_windows else _wait_readable(list(open_fds), 0.1)
+            )
+            read_any = False
+            for fd in readable:
+                try:
+                    raw = os.read(fd, 2**16)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    open_fds.discard(fd)
+                    continue
+                if not raw:
+                    open_fds.discard(fd)
+                    continue
+                read_any = True
+                captured_bytes += len(raw)
+                data = raw.decode("utf-8", errors="replace")
+                target = stdout if fd == self.stdout_fd else stderr
+                stream = sys.stdout if fd == self.stdout_fd else sys.stderr
+                target.append(data)
+                if output:
+                    print(data, end="", file=stream)
+            if _is_windows and not read_any:
+                time.sleep(0.1)
+        return captured_bytes
+
+    def _handle_shell_exit(
+        self,
+        stdout: list[str],
+        stderr: list[str],
+        output: bool,
+        max_output_bytes: int,
+        captured_bytes: int,
+    ) -> tuple[int | None, str, str]:
+        """Restart a persistent shell that exited during a command."""
+        try:
+            rc: int | None = self.process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            rc = None
+        captured_bytes = self._drain_closed_shell_pipes(
+            stdout, stderr, output, max_output_bytes, captured_bytes
+        )
+        if captured_bytes > max_output_bytes:
+            return self._kill_for_byte_cap(stdout, stderr, output, max_output_bytes)
+        logger.warning(
+            "Shell process exited during command (code %s), restarting shell", rc
+        )
+        self.restart()
+        stderr.append(
+            f"\n[gptme] The shell exited (code {rc}), so a fresh shell was "
+            "started; cwd, variables and `&` jobs from the old shell are gone. "
+            "Don't run `exit` in the tool shell — it never needs to be exited.\n"
+        )
+        return (
+            rc if rc is not None else -1,
+            trim_blank_lines("".join(stdout)),
+            trim_blank_lines("".join(stderr)),
+        )
+
+    def _kill_for_byte_cap(
+        self,
+        stdout: list[str],
+        stderr: list[str],
+        output: bool,
+        max_output_bytes: int,
+    ) -> tuple[int | None, str, str]:
+        """Kill the process for exceeding the byte cap, drain pipes, return -125.
+
+        Appends the truncation marker to stdout, terminates the process group,
+        drains any remaining output from both pipes (so it does not bleed into
+        the next command), and returns the synthetic -125 tuple.
+        """
+        cap_mib = max_output_bytes / (1024 * 1024)
+        trunc_msg = f"\n[output truncated at {cap_mib:.0f} MiB, process killed]\n"
+        stdout.append(trunc_msg)
+        if output:
+            print(trunc_msg, end="", file=sys.stdout)
+        logger.warning(
+            "Shell output cap (%d MiB) exceeded; killing process",
+            int(cap_mib),
+        )
+        try:
+            pgid = os.getpgid(self.process.pid)
+            os.killpg(pgid, signal.SIGTERM)
+            time.sleep(0.1)
+            # SIGKILL the whole process group unconditionally. If the shell
+            # leader exits after SIGTERM while a descendant retains an
+            # inherited output pipe, a descendant could keep emitting and the
+            # unbounded drain below would recreate the memory exhaustion this
+            # cap is meant to prevent (Greptile P1 Security).
+            os.killpg(pgid, signal.SIGKILL)
+        except Exception as e:
+            logger.warning("Error killing process after byte cap exceeded: %s", e)
+        # Drain any remaining data from both pipes so it does not bleed into the
+        # next command's output, BUT keep the drain bounded (Greptile P1).
+        # After a group SIGKILL there is only kernel-buffered data left; guard
+        # both the total drained bytes and the drain duration so a surviving
+        # descendant cannot keep the loop live and grow memory.
+        drain_budget = max_output_bytes  # at most one cap's worth more
+        drain_deadline = time.monotonic() + 1.0  # hard time bound
+        for drain_fd in (self.stdout_fd, self.stderr_fd):
+            drain_empty_count = 0
+            while (
+                drain_empty_count < 2
+                and drain_budget > 0
+                and time.monotonic() < drain_deadline
+            ):
+                drain_rlist = _wait_readable([drain_fd], 0.1)
+                if not drain_rlist:
+                    drain_empty_count += 1
+                    continue
+                drain_raw = os.read(drain_fd, min(2**16, drain_budget))
+                if not drain_raw:
+                    drain_empty_count += 1
+                    continue
+                drain_empty_count = 0
+                drain_budget -= len(drain_raw)
+                drain_data = drain_raw.decode("utf-8", errors="replace")
+                if drain_fd == self.stdout_fd:
+                    stdout.append(drain_data)
+                    if output:
+                        print(drain_data, end="", file=sys.stdout)
+                else:
+                    stderr.append(drain_data)
+                    if output:
+                        print(drain_data, end="", file=sys.stderr)
+        return (
+            -125,
+            trim_blank_lines("".join(stdout)),
+            trim_blank_lines("".join(stderr)),
+        )
+
+    def _terminate_process(self) -> None:
+        """Terminate the shell process, platform-aware."""
+        try:
+            if _is_windows:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=1.0)
+            else:
+                pgid = os.getpgid(self.process.pid)
+                os.killpg(pgid, signal.SIGTERM)
+                time.sleep(0.1)
+                if self.process.poll() is None:
+                    os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            logger.warning(f"Error terminating process: {e}")
+
+    def close(self):
+        # Close stdin to signal no more input
+        if self.process.stdin:
+            self.process.stdin.close()
+
+        # Terminate the process
+        self._terminate_process()
+
+        # Close stdout/stderr AFTER process is terminated to prevent broken pipes
+        if self.process.stdout:
+            self.process.stdout.close()
+        if self.process.stderr:
+            self.process.stderr.close()
+
+    def restart(self):
+        self.close()
+        self._init()
+
+
+_shell_var: ContextVar[ShellSession | None] = ContextVar("shell", default=None)
+_workspace_cwd: ContextVar[str | None] = ContextVar("workspace_cwd", default=None)
+
+# Conversation-level shell registry for server-side cleanup.
+# Maps conversation_id -> ShellSession so SESSION_END hooks can find and close
+# shells that would otherwise leak when their thread's ContextVar goes out of scope.
+_conversation_shells: dict[str, ShellSession] = {}
+_conv_shell_lock: threading.Lock = threading.Lock()
+
+
+def set_workspace_cwd(cwd: str) -> None:
+    """Set the workspace directory for the current context (thread-safe).
+
+    Call this before any shell creation to ensure the shell subprocess
+    starts in the correct directory, even with concurrent sessions.
+    This is the thread-safe replacement for os.chdir() in server contexts.
+    """
+    _workspace_cwd.set(cwd)
+
+
+def get_workspace_cwd() -> str | None:
+    """Get the workspace directory for the current context, if set."""
+    return _workspace_cwd.get()
+
+
+def get_shell() -> ShellSession:
+    """Get the shell session for the current context, creating it if necessary.
+
+    Uses ContextVar to provide context-local state, allowing each conversation
+    to have its own shell session with independent working directory.
+
+    In server contexts (where current_conversation_id is set), also registers
+    the shell in a conversation-level registry for cleanup via SESSION_END hooks.
+    """
+    shell = _shell_var.get()
+    if shell is None:
+        # Use workspace from ContextVar for thread-safe cwd
+        workspace = _workspace_cwd.get()
+        shell = ShellSession(cwd=workspace)
+        _shell_var.set(shell)
+        # Register for conversation-level cleanup if in a server context
+        _register_conversation_shell(shell)
+    return shell
+
+
+def set_shell(shell: ShellSession) -> None:
+    """Set the shell session for the current context (for testing)."""
+    _shell_var.set(shell)
+
+
+def _register_conversation_shell(shell: ShellSession) -> None:
+    """Register a shell in the conversation-level registry if a conversation context exists."""
+    try:
+        from ..hooks import current_conversation_id
+
+        conv_id = current_conversation_id.get()
+        if conv_id is not None:
+            with _conv_shell_lock:
+                # Close any existing shell for this conversation before replacing
+                old_shell = _conversation_shells.get(conv_id)
+                if old_shell is not None and old_shell is not shell:
+                    try:
+                        old_shell.close()
+                    except Exception as e:
+                        logger.warning(
+                            f"Error closing old shell for conversation {conv_id}: {e}"
+                        )
+                _conversation_shells[conv_id] = shell
+    except ImportError:
+        pass  # hooks module not available (e.g., during testing)
+
+
+def close_conversation_shell(conversation_id: str) -> None:
+    """Close and remove the shell session for a conversation.
+
+    Called by the SESSION_END hook to clean up shell file descriptors
+    when a conversation's last session is removed.
+    """
+    with _conv_shell_lock:
+        shell = _conversation_shells.pop(conversation_id, None)
+    if shell is not None:
+        try:
+            shell.close()
+            logger.debug(f"Closed shell session for conversation {conversation_id}")
+        except Exception as e:
+            logger.warning(
+                f"Error closing shell for conversation {conversation_id}: {e}"
+            )
+
+
+def _session_end_shell_cleanup(
+    manager: "LogManager", **kwargs
+) -> "Generator[Message | StopPropagation, None, None]":
+    """Close shell session for a conversation to prevent file descriptor leaks.
+
+    Registered as a SESSION_END hook via ToolSpec.hooks so it's only loaded
+    when the shell tool is active.
+    """
+    conversation_id = manager.logdir.name if manager.logdir else None
+    if conversation_id:
+        close_conversation_shell(conversation_id)
+        reset_background_jobs(conversation_id, all_conversations=False)
+
+    yield from ()
+
+
+def get_shell_command(
+    code: str | None, args: list[str] | None, kwargs: dict[str, str] | None
+) -> str:
+    """Get the shell command from code/args/kwargs."""
+    if code is not None and args is not None:
+        assert not args
+        cmd = code.strip()
+        cmd = cmd.removeprefix("$ ")
+    elif kwargs is not None:
+        cmd = kwargs.get("command", "")
+    else:
+        raise ValueError("No command provided")
+    return cmd
+
+
+def preview_shell(cmd: str, _: Path | None) -> str:
+    """Prepare preview for shell command."""
+    return cmd
+
+
+def _get_truncation_budget(
+    pre_env: str,
+    post_env: str,
+    default_pre: int,
+    default_post: int,
+) -> tuple[int, int]:
+    """Resolve head/tail token budgets for output truncation.
+
+    Reads ``pre_env`` and ``post_env`` env vars, falling back to defaults on
+    missing or invalid values. Negative or zero values fall back too — the
+    truncation path requires both to be positive.
+
+    Env vars are re-read on every call so that users can adjust thresholds at
+    runtime (e.g. via a shell alias) without restarting gptme.
+    """
+
+    def _resolve(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning("Invalid %s value: %r, using default %d", name, raw, default)
+            return default
+        if value <= 0:
+            logger.warning(
+                "Non-positive %s value: %d, using default %d", name, value, default
+            )
+            return default
+        return value
+
+    return _resolve(pre_env, default_pre), _resolve(post_env, default_post)
+
+
+def _default_model_name() -> str:
+    from ..llm.models import get_default_model  # fmt: skip
+
+    model = get_default_model()
+    return model.model if model else "cl100k_base"
+
+
+def _matches_git_log_oneline(cmd: str) -> bool:
+    if any(ch in cmd for ch in "\n|;&<>`$"):
+        return False
+
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+
+    if len(tokens) < 3 or tokens[:2] != ["git", "log"]:
+        return False
+
+    return any(token == "--oneline" for token in tokens[2:])
+
+
+def _matches_gh_list(cmd: str) -> bool:
+    """Detect ``gh issue list`` or ``gh pr list`` commands (tabular output only)."""
+    if any(ch in cmd for ch in "\n|;&<>`$"):
+        return False
+
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+
+    if len(tokens) < 3 or tokens[0] != "gh":
+        return False
+
+    if not (tokens[1] in ("issue", "pr") and tokens[2] == "list"):
+        return False
+
+    # Reject JSON output formats — truncating a JSON array at line boundaries
+    # produces invalid JSON that the model cannot parse.
+    flags = tokens[3:]
+    for i, tok in enumerate(flags):
+        if tok.startswith("--json"):
+            return False
+        if tok.startswith("--format="):
+            return False
+        if tok == "--format" and i + 1 < len(flags) and flags[i + 1] == "json":
+            return False
+
+    return True
+
+
+def _format_git_log_preview(cmd: str, stdout: str, logdir: Path | None) -> str | None:
+    lines = [line for line in strip_ansi_codes(stdout).splitlines() if line.strip()]
+    if len(lines) <= _GIT_LOG_PREVIEW_LINES:
+        return None
+
+    saved_path: Path | None = None
+    if logdir:
+        _, saved_path = save_large_output(
+            content=stdout,
+            logdir=logdir,
+            output_type="shell",
+            command_info=cmd,
+        )
+
+    omitted = len(lines) - _GIT_LOG_PREVIEW_LINES
+    preview = "\n".join(
+        lines[:_GIT_LOG_PREVIEW_LINES] + [f"... ({omitted} more commits omitted) ..."]
+    )
+
+    detail = f"Showing first {_GIT_LOG_PREVIEW_LINES} of {len(lines)} commits."
+    if saved_path:
+        detail += (
+            f" Full output saved to {saved_path}; read that file for the complete list."
+        )
+    else:
+        detail += (
+            " Full output was not saved because no conversation logdir is active."
+            " To get the full list, pipe through cat: `git log --oneline | cat`."
+        )
+    detail += " Use `git show <sha>` for a specific commit."
+
+    body = detail + "\n\n" + md_codeblock("stdout", preview)
+
+    if logdir and saved_path:
+        model_name = _default_model_name()
+        try:
+            record_context_savings(
+                logdir=logdir,
+                source="shell",
+                original_tokens=len_tokens(stdout, model_name),
+                kept_tokens=len_tokens(body, model_name),
+                command_info=f"git_log_oneline: {cmd}",
+                saved_path=saved_path,
+            )
+        except OSError as e:
+            logger.warning("Failed to record compact shell telemetry: %s", e)
+
+    return body
+
+
+def _format_gh_list_preview(cmd: str, stdout: str, logdir: Path | None) -> str | None:
+    """Format a compact preview for ``gh issue list`` / ``gh pr list`` output."""
+    lines = [line for line in strip_ansi_codes(stdout).splitlines() if line.strip()]
+    if len(lines) <= _GH_LIST_PREVIEW_LINES:
+        return None
+
+    saved_path: Path | None = None
+    if logdir:
+        _, saved_path = save_large_output(
+            content=stdout,
+            logdir=logdir,
+            output_type="shell",
+            command_info=cmd,
+        )
+
+    omitted = len(lines) - _GH_LIST_PREVIEW_LINES
+    preview = "\n".join(
+        lines[:_GH_LIST_PREVIEW_LINES] + [f"... ({omitted} more items omitted) ..."]
+    )
+
+    detail = f"Showing first {_GH_LIST_PREVIEW_LINES} of {len(lines)} items."
+    if saved_path:
+        detail += (
+            f" Full output saved to {saved_path}; read that file for the complete list."
+        )
+    else:
+        detail += (
+            " Full output was not saved because no conversation logdir is active."
+            f" To get the full list, pipe through cat: `{cmd} | cat`."
+        )
+    detail += " Use `gh issue view <number>` or `gh pr view <number>` for details."
+
+    body = detail + "\n\n" + md_codeblock("stdout", preview)
+
+    if logdir and saved_path:
+        model_name = _default_model_name()
+        try:
+            record_context_savings(
+                logdir=logdir,
+                source="shell",
+                original_tokens=len_tokens(stdout, model_name),
+                kept_tokens=len_tokens(body, model_name),
+                command_info=f"gh_list: {cmd}",
+                saved_path=saved_path,
+            )
+        except OSError as e:
+            logger.warning("Failed to record compact shell telemetry: %s", e)
+
+    return body
+
+
+def _format_query_pruned_output(
+    cmd: str,
+    stdout: str,
+    logdir: Path | None,
+) -> str | None:
+    plan = plan_tool_output_prune("shell", stdout, context_label=cmd)
+    if not plan:
+        return None
+
+    lines = stdout.splitlines()
+    pruned_stdout = plan.apply(lines)
+    effective_logdir = logdir or get_path_fn()
+
+    saved_path: Path | None = None
+    if effective_logdir:
+        _, saved_path = save_large_output(
+            content=stdout,
+            logdir=effective_logdir,
+            output_type="shell",
+            command_info=cmd,
+        )
+
+    detail = f"Pruned to {plan.kept_lines} of {plan.total_lines} lines for the current query."
+    if saved_path:
+        detail += f" Full output saved to {saved_path}; read that file for the complete result."
+    else:
+        detail += " Full output was not saved because no conversation logdir is active."
+
+    body = detail + "\n\n" + md_codeblock("stdout", pruned_stdout)
+
+    if effective_logdir:
+        try:
+            kept_tokens = len_tokens(body, plan.model)
+        except Exception:
+            kept_tokens = plan.kept_tokens
+        record_context_savings(
+            logdir=effective_logdir,
+            source="shell",
+            original_tokens=plan.original_tokens,
+            kept_tokens=kept_tokens,
+            command_info=f"query-pruned: {cmd}",
+            saved_path=saved_path,
+        )
+
+    return body
+
+
+def _format_shell_output(
+    cmd: str,
+    stdout: str,
+    stderr: str,
+    returncode: int | None,
+    interrupted: bool,
+    allowlisted: bool,
+    timed_out: bool = False,
+    timeout_value: float | None = None,
+    logdir: Path | None = None,
+    byte_cap_exceeded: bool = False,
+    cap_bytes: int | None = None,
+) -> str:
+    """Format shell command output into a message."""
+    # Strip ANSI escape sequences from output
+    stdout = strip_ansi_codes(stdout)
+    stderr = strip_ansi_codes(stderr)
+
+    compact_stdout = None
+    if (
+        returncode == 0
+        and stdout
+        and not stderr
+        and not interrupted
+        and not timed_out
+        and not byte_cap_exceeded
+        and _matches_git_log_oneline(cmd)
+    ):
+        try:
+            compact_stdout = _format_git_log_preview(cmd, stdout, logdir)
+        except OSError as e:
+            logger.warning("Failed to format compact shell output: %s", e)
+
+    if compact_stdout is None and (
+        returncode == 0
+        and stdout
+        and not stderr
+        and not interrupted
+        and not timed_out
+        and not byte_cap_exceeded
+        and _matches_gh_list(cmd)
+    ):
+        try:
+            compact_stdout = _format_gh_list_preview(cmd, stdout, logdir)
+        except OSError as e:
+            logger.warning("Failed to format compact shell output: %s", e)
+
+    if compact_stdout is None and (
+        returncode == 0
+        and stdout
+        and not stderr
+        and not interrupted
+        and not timed_out
+        and not byte_cap_exceeded
+    ):
+        try:
+            compact_stdout = _format_query_pruned_output(cmd, stdout, logdir)
+        except OSError as e:
+            logger.warning("Failed to format query-pruned shell output: %s", e)
+
+    if compact_stdout is None:
+        # Apply shortening logic with output storage
+        pre_tokens, post_tokens = _get_truncation_budget(
+            "GPTME_SHELL_TRUNC_PRE_TOKENS",
+            "GPTME_SHELL_TRUNC_POST_TOKENS",
+            default_pre=_TRUNC_PRE_TOKENS_DEFAULT,
+            default_post=_TRUNC_POST_TOKENS_DEFAULT,
+        )
+        stderr_pre_tokens, stderr_post_tokens = _get_truncation_budget(
+            "GPTME_SHELL_TRUNC_STDERR_PRE_TOKENS",
+            "GPTME_SHELL_TRUNC_STDERR_POST_TOKENS",
+            default_pre=_TRUNC_STDERR_PRE_TOKENS_DEFAULT,
+            default_post=_TRUNC_STDERR_POST_TOKENS_DEFAULT,
+        )
+        stdout = _shorten_stdout(
+            stdout,
+            pre_tokens=pre_tokens,
+            post_tokens=post_tokens,
+            logdir=logdir,
+            cmd=cmd,
+        )
+        stderr = _shorten_stdout(
+            stderr,
+            pre_tokens=stderr_pre_tokens,
+            post_tokens=stderr_post_tokens,
+            logdir=logdir,
+            cmd=f"{cmd} (stderr)",
+        )
+
+    # Format header
+    if byte_cap_exceeded:
+        cap_bytes = cap_bytes or _DEFAULT_MAX_OUTPUT_BYTES
+        cap_mib = cap_bytes / (1024 * 1024)
+        header = f"Command killed (output exceeded {cap_mib:.0f} MiB cap)"
+    elif timed_out:
+        header = (
+            f"Command timed out (after {timeout_value}s)"
+            if timeout_value
+            else "Command timed out"
+        )
+    elif interrupted:
+        header = "Command interrupted"
+    else:
+        header = f"Ran {'allowlisted ' if allowlisted else ''}command"
+
+    # Truncate long commands to reduce context waste (Issue #974)
+    # The full command is already visible in the assistant's code block
+    if len(cmd) > 100 or cmd.count("\n") > 2:
+        first_line = cmd.split("\n")[0][:80]
+        line_count = cmd.count("\n") + 1
+        cmd_display = (
+            f"{first_line}... ({line_count} {'line' if line_count == 1 else 'lines'})"
+        )
+    else:
+        cmd_display = cmd
+
+    msg = _format_block_smart(header, cmd_display, lang="bash") + "\n\n"
+
+    # Add output
+    if compact_stdout:
+        msg += compact_stdout + "\n\n"
+    elif stdout:
+        msg += _format_block_smart("", stdout, "stdout").lstrip() + "\n\n"
+    if stderr:
+        msg += _format_block_smart("", stderr, "stderr").lstrip() + "\n\n"
+    if not compact_stdout and not stdout and not stderr:
+        if byte_cap_exceeded:
+            msg += "No output before byte cap\n"
+        elif timed_out:
+            msg += "No output before timeout\n"
+        elif interrupted:
+            msg += "No output before interruption\n"
+        else:
+            msg += "No output\n"
+
+    # Add status info
+    if interrupted:
+        if returncode is not None:
+            msg += f"Process interrupted (return code: {returncode})\n"
+        else:
+            msg += "Process interrupted\n"
+    elif byte_cap_exceeded or timed_out:
+        pass  # Header already describes the termination; return code is synthetic
+    elif returncode:
+        msg += f"Return code: {returncode}\n"
+
+    return msg
+
+
+def execute_shell_impl(
+    cmd: str, logdir: Path | None, timeout: float | None = None
+) -> Generator[Message, None, None]:
+    """Execute shell command and format output."""
+    shell = get_shell()
+    allowlisted = is_allowlisted(cmd, cwd=shell.get_cwd())
+
+    start_time = time.monotonic()
+    try:
+        returncode, stdout, stderr = shell.run(cmd, timeout=timeout)
+        interrupted = False
+        timed_out = returncode == -124  # Our timeout return code
+        byte_cap_exceeded = returncode == -125  # Output byte cap return code
+    except KeyboardInterrupt as e:
+        # Extract partial output and handle subprocess termination
+        stdout = stderr = ""
+        if e.args and isinstance(e.args[0], tuple) and len(e.args[0]) == 2:
+            stdout, stderr = e.args[0]
+
+        _terminate_interrupted_shell(shell)
+
+        returncode = shell.process.returncode
+        interrupted = True
+        timed_out = False
+        byte_cap_exceeded = False
+    except Exception as e:
+        raise ValueError(f"Shell error: {e}") from None
+    duration = time.monotonic() - start_time
+
+    # Format and yield output
+    msg = _format_shell_output(
+        cmd,
+        stdout,
+        stderr,
+        returncode,
+        interrupted,
+        allowlisted,
+        timed_out,
+        timeout_value=timeout,
+        logdir=logdir,
+        byte_cap_exceeded=byte_cap_exceeded,
+        cap_bytes=_get_max_output_bytes() if byte_cap_exceeded else None,
+    )
+    # Workspace-awareness: notify when cd enters a directory with gptme.toml.
+    # Append hint text directly to the command output (single yield) so no
+    # separate message is interleaved between the assistant tool_calls entry
+    # and the tool response.  The serializer converts system messages without
+    # a call_id to user-role messages; any message interleaved between
+    # tool_calls and the tool result causes strict providers (e.g. Moonshot AI
+    # / kimi-k2.6) to reject the conversation with a 400 error.
+    workspace_hint_content = ""
+    if returncode == 0 and not interrupted:
+        cmd_stripped = cmd.strip()
+        if cmd_stripped.startswith("cd ") or cmd_stripped == "cd":
+            hint = _check_workspace_config()
+            if hint:
+                workspace_hint_content = "\n\n" + hint.content
+
+    # stdout/stderr were already streamed live by ShellSession (both the
+    # persistent-pipe and the TTY path stream as bytes arrive), so the
+    # terminal projection only needs to render details that were not already
+    # shown: the header (with duration/line-count for a non-TTY reader
+    # tailing a log), and any failure/truncation detail.
+    header_line = msg.split("\n\n", 1)[0]
+    line_count = len(stdout.splitlines()) + len(stderr.splitlines())
+    meta_bits = [f"{duration:.1f}s"]
+    if line_count:
+        meta_bits.append(f"{line_count} {'line' if line_count == 1 else 'lines'}")
+    meta_suffix = " · " + " · ".join(meta_bits)
+    if header_line.endswith("```"):
+        header_line += "\n" + meta_suffix.lstrip(" ·")
+    else:
+        header_line += meta_suffix
+    terminal_parts = [header_line]
+    if not stdout and not stderr:
+        remainder = msg.split("\n\n", 1)[1] if "\n\n" in msg else ""
+        if remainder.strip():
+            terminal_parts.append(remainder.strip())
+    else:
+        if interrupted:
+            terminal_parts.append("Command interrupted")
+        elif returncode:
+            terminal_parts.append(f"Return code: {returncode}")
+        # Detail markers generated by compact/truncated formatting precede the
+        # first output codeblock. Do not scan user output: it can legitimately
+        # contain marker-like text that was already streamed to the terminal.
+        details = msg.split("```", 1)[0]
+        truncation_lines = [
+            line.strip()
+            for line in details.splitlines()
+            if line.strip().startswith("... (") and "truncated" in line
+        ]
+        if truncation_lines:
+            terminal_parts.extend(truncation_lines)
+        # Compact previews (git-log/gh-list/query-pruned) put their recovery
+        # info — the kept/total counts and saved-output path — in a detail
+        # line ahead of the codeblock, not in a "... (truncated)" marker.
+        # Without it, users can't tell how much was pruned or where to find
+        # the rest.
+        compact_detail_lines = [
+            line.strip()
+            for line in details.splitlines()
+            if line.strip().startswith(("Showing first ", "Pruned to "))
+        ]
+        if compact_detail_lines:
+            terminal_parts.extend(compact_detail_lines)
+    if workspace_hint_content:
+        terminal_parts.append(workspace_hint_content.strip())
+
+    yield Message(
+        "system",
+        msg + workspace_hint_content,
+        terminal_display_content="\n\n".join(terminal_parts),
+    )
+
+    if interrupted:
+        raise KeyboardInterrupt from None
+
+
+# Workspace paths already hinted this session, so we don't spam the
+# "Workspace detected" message on every cd into the same workspace.
+_hinted_workspaces: set[str] = set()
+
+
+def _check_workspace_config() -> Message | None:
+    """Return a hint message if the current directory has a gptme.toml config.
+
+    Called after a successful ``cd`` to let the agent know it can spawn a
+    workspace-aware subagent instead of running in a generic context.
+    Returns None if no gptme.toml is found (or CWD lookup fails), or if this
+    workspace has already been hinted this session.
+    """
+    try:
+        cwd = Path.cwd()
+    except (FileNotFoundError, OSError):
+        return None
+
+    config_file = cwd / "gptme.toml"
+    if not config_file.exists():
+        return None
+
+    # Only hint once per workspace per session.
+    workspace_key = str(cwd.resolve())
+    if workspace_key in _hinted_workspaces:
+        return None
+    _hinted_workspaces.add(workspace_key)
+
+    workspace_name = cwd.name
+    return Message(
+        "system",
+        f"📂 Workspace detected: `{cwd}` has a `gptme.toml` config.\n"
+        f"To work within this workspace context (custom tools, files, prompt), "
+        f"spawn a subagent here:\n"
+        f"```ipython\n"
+        f'subagent("{workspace_name}", "Your task here", workdir="{cwd}", use_subprocess=True)\n'
+        f"```\n"
+        f"The subagent will load the workspace config from `{config_file}`.",
+    )
+
+
+def _terminate_interrupted_shell(
+    shell: ShellSession, log_context: str = "Shell command"
+) -> None:
+    logger.info("%s interrupted, sending SIGINT to subprocess", log_context)
+    try:
+        if _is_windows:
+            shell.process.terminate()
+            shell.process.wait(timeout=2.0)
+        else:
+            pgid = os.getpgid(shell.process.pid)
+            os.killpg(pgid, signal.SIGINT)
+            shell.process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        logger.info("Process didn't exit gracefully, terminating")
+        try:
+            if _is_windows:
+                shell.process.kill()
+            else:
+                pgid = os.getpgid(shell.process.pid)
+                os.killpg(pgid, signal.SIGTERM)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("Error terminating interrupted process: %s", e)
+
+
+def get_path_fn(*args, **kwargs) -> Path | None:
+    from ..logmanager import LogManager  # fmt: skip
+
+    manager = LogManager.get_current_log()
+    return manager.logdir if manager and manager.logdir else None
+
+
+def _get_timeout() -> float | None:
+    timeout: float | None = 1200.0
+    timeout_env = os.environ.get("GPTME_SHELL_TIMEOUT")
+    if timeout_env is not None:
+        try:
+            timeout = float(timeout_env)
+            if timeout <= 0:
+                timeout = None
+        except ValueError:
+            logger.warning(
+                "Invalid GPTME_SHELL_TIMEOUT value: %s, using default 1200s (20 minutes)",
+                timeout_env,
+            )
+            timeout = 1200.0
+    return timeout
+
+
+def execute_shell(
+    code: str | None,
+    args: list[str] | None,
+    kwargs: dict[str, str] | None,
+) -> Generator[Message, None, None]:
+    """Execute a shell command, optionally as a harness-owned background job."""
+    cmd = get_shell_command(code, args, kwargs)
+    cmd_stripped = cmd.strip()
+    background_value: object = (kwargs or {}).get("background", False)
+    background = background_value is True or (
+        isinstance(background_value, str)
+        and background_value.lower() in {"1", "true", "yes", "on"}
+    )
+
+    # Management commands remain available, but only as complete tool calls and
+    # only when they refer to this conversation's harness-owned jobs. Otherwise
+    # Bash owns the command (notably its ``jobs``, ``wait``, and ``kill`` builtins).
+    if cmd_stripped == "jobs" and list_background_jobs():
+        yield from execute_jobs_command()
+        return
+    if match := re.fullmatch(r"output (\d+)( --new)?", cmd_stripped):
+        if get_background_job(int(match.group(1))) is not None:
+            suffix = " --new" if match.group(2) else ""
+            yield from execute_output_command(f"{match.group(1)}{suffix}")
+            return
+    if match := re.fullmatch(r"wait (\d+)(?: ([^\s]+))?", cmd_stripped):
+        if get_background_job(int(match.group(1))) is not None:
+            yield from execute_wait_command(match.group(1), match.group(2))
+            return
+    if match := re.fullmatch(r"kill (\d+)", cmd_stripped):
+        if get_background_job(int(match.group(1))) is not None:
+            yield from execute_kill_command(match.group(1))
+            return
+
+    timeout = _get_timeout()
+
+    # Check with shellcheck if available
+    has_issues, should_block, shellcheck_msg = check_with_shellcheck(cmd)
+    if has_issues:
+        yield Message("system", shellcheck_msg)
+        if should_block:
+            return
+
+    is_denied, deny_reason, matched_cmd = is_denylisted(cmd)
+    if is_denied:
+        yield Message("system", f"Command denied: `{matched_cmd}`\n\n{deny_reason}")
+        return
+
+    logger.debug("Routing shell command through hook chain: %s", cmd[:80])
+
+    def execute_fn(command: str, path: Path | None) -> Generator[Message, None, None]:
+        is_edited_denied, edited_deny_reason, edited_matched_cmd = is_denylisted(
+            command
+        )
+        if is_edited_denied:
+            yield Message(
+                "system",
+                f"Command denied: `{edited_matched_cmd}`\n\n{edited_deny_reason}",
+            )
+            return
+        if background:
+            job = start_background_job(command, memory_limit=_get_memory_limit())
+            yield Message(
+                "system",
+                f"Started background shell job #{job.id}: `{command}`\n\n"
+                "Completion will be reported automatically.",
+            )
+            return
+        yield from execute_shell_impl(command, path, timeout=timeout)
+
+    yield from execute_with_confirmation(
+        cmd,
+        args,
+        kwargs,
+        execute_fn=execute_fn,
+        get_path_fn=get_path_fn,
+        preview_fn=preview_shell,
+        preview_lang="bash",
+        confirm_msg="Run command in background?" if background else "Run command?",
+        allow_edit=True,
+        confirmation_workspace=get_shell().get_cwd(),
+    )
+
+
+def _format_block_smart(header: str, cmd: str, lang="") -> str:
+    # prints block as a single line if it fits, otherwise as a code block
+    s = ""
+    if header:
+        s += f"{header}:"
+    if len(cmd.split("\n")) == 1:
+        s += f" `{cmd}`"
+    else:
+        s += f"\n```{lang}\n{cmd}\n```"
+    return s
+
+
+def _shorten_stdout(
+    stdout: str,
+    pre_lines=None,
+    post_lines=None,
+    pre_tokens=None,
+    post_tokens=None,
+    strip_dates=False,
+    strip_common_prefix_lines=0,
+    logdir: Path | None = None,
+    cmd: str | None = None,
+) -> str:
+    lines = stdout.split("\n")
+
+    # Save full output before truncation if it will be truncated
+    will_truncate_by_lines = (
+        pre_lines is not None
+        and post_lines is not None
+        and len(lines) > pre_lines + post_lines
+    )
+    will_truncate_by_tokens = False
+    tokenizer = None
+    tokens: list[int] = []
+    # Resolved lazily on first use, reused by tokenizer + savings-recording paths.
+    model_name: str | None = None
+    if pre_tokens is not None and post_tokens is not None:
+        from ..llm.models import get_default_model  # fmt: skip
+
+        model = get_default_model()
+        model_name = model.model if model else "gpt-4"
+        tokenizer = get_tokenizer(model_name)
+        if tokenizer is not None:
+            tokens = tokenizer.encode(stdout)
+            will_truncate_by_tokens = len(tokens) > pre_tokens + post_tokens
+        else:
+            # Char-based approximation (~4 chars/token) when tokenizer unavailable
+            will_truncate_by_tokens = len(stdout) > (pre_tokens + post_tokens) * 4
+
+    # If truncation will happen, save full output to file
+    saved_path = None
+    if will_truncate_by_lines or will_truncate_by_tokens:
+        # Fallback: if the caller didn't pass logdir (e.g. a code path that
+        # bypassed execute_shell's get_path_fn), try the current LogManager
+        # context directly. This avoids silent telemetry loss in cases where
+        # the parameter wasn't threaded through correctly.
+        if logdir is None:
+            from ..logmanager import LogManager  # fmt: skip
+
+            manager = LogManager.get_current_log()
+            if manager and manager.logdir:
+                logdir = manager.logdir
+                logger.debug(
+                    "_shorten_stdout: recovered logdir from current LogManager"
+                )
+
+        if logdir is not None:
+            command_info = f"Command: {cmd}" if cmd else None
+            original_tokens = (
+                len(tokens)
+                if (will_truncate_by_tokens and tokenizer is not None)
+                else None
+            )
+            _, saved_path = save_large_output(
+                content=stdout,
+                logdir=logdir,
+                output_type="shell",
+                command_info=command_info,
+                original_tokens=original_tokens,
+            )
+        else:
+            logger.warning(
+                "_shorten_stdout: truncating output but no logdir is available; "
+                "full output will not be saved and context-savings ledger entry "
+                "will be skipped (cmd=%s, lines=%s)",
+                cmd,
+                len(lines),
+            )
+
+    # NOTE: This can cause issues when, for example, reading a CSV with dates in the first column
+    if strip_dates:
+        # strip iso8601 timestamps
+        lines = [
+            re.sub(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[.]\d{3,9}Z?", "", line)
+            for line in lines
+        ]
+        # strip dates like "2017-08-02 08:48:43 +0000 UTC"
+        lines = [
+            re.sub(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}( [+]\d{4})?( UTC)?", "", line)
+            for line in lines
+        ]
+
+    # strip common prefixes, useful for things like `gh runs view`
+    if strip_common_prefix_lines and len(lines) >= strip_common_prefix_lines:
+        prefix = os.path.commonprefix([line.rstrip() for line in lines])
+        if prefix:
+            lines = [line[len(prefix) :] for line in lines]
+
+    # check that if pre_lines is set, so is post_lines, and vice versa
+    assert (pre_lines is None) == (post_lines is None)
+    # Skip line truncation if token truncation will happen (token truncation is more precise)
+    if (
+        pre_lines is not None
+        and post_lines is not None
+        and len(lines) > pre_lines + post_lines
+        and not will_truncate_by_tokens
+    ):
+        truncation_msg = f"... ({len(lines) - pre_lines - post_lines} lines truncated"
+        if saved_path:
+            truncation_msg += f", full output saved to {saved_path}"
+        truncation_msg += ") ..."
+        lines = lines[:pre_lines] + [truncation_msg] + lines[-post_lines:]
+
+    # check that if pre_tokens is set, so is post_tokens, and vice versa
+    assert (pre_tokens is None) == (post_tokens is None)
+    if pre_tokens is not None and post_tokens is not None:
+        if not will_truncate_by_tokens and tokenizer is None:
+            # tokenizer may still be unavailable (char-based estimate used above);
+            # try once more for a precise check before deciding not to truncate.
+            from ..llm.models import get_default_model  # fmt: skip
+
+            model = get_default_model()
+            tokenizer = get_tokenizer(model.model if model else "gpt-4")
+            if tokenizer is not None:
+                tokens = tokenizer.encode(stdout)
+        if tokenizer is not None and len(tokens) > pre_tokens + post_tokens:
+            truncation_msg = "... (output truncated"
+            if saved_path:
+                truncation_msg += f", full output saved to {saved_path}"
+            truncation_msg += ") ..."
+            lines = (
+                [tokenizer.decode(tokens[:pre_tokens])]
+                + [truncation_msg]
+                + [tokenizer.decode(tokens[-post_tokens:])]
+            )
+        elif tokenizer is None and will_truncate_by_tokens:
+            # Char-based fallback when tokenizer unavailable (~4 chars/token)
+            pre_chars = pre_tokens * 4
+            post_chars = post_tokens * 4
+            truncation_msg = "... (output truncated"
+            if saved_path:
+                truncation_msg += f", full output saved to {saved_path}"
+            truncation_msg += ") ..."
+            lines = [stdout[:pre_chars]] + [truncation_msg] + [stdout[-post_chars:]]
+
+    result = "\n".join(lines)
+
+    if saved_path and logdir:
+        if model_name is None:
+            from ..llm.models import get_default_model  # fmt: skip
+
+            model = get_default_model()
+            model_name = model.model if model else "gpt-4"
+        record_context_savings(
+            logdir=logdir,
+            source="shell",
+            original_tokens=len_tokens(stdout, model_name),
+            kept_tokens=len_tokens(result, model_name),
+            command_info=cmd,
+            saved_path=saved_path,
+        )
+
+    return result
+
+
+def _find_max_heredoc_pos(node, current_max: int = 0) -> int:
+    """Recursively find the maximum position from any heredoc nodes.
+
+    This is needed because bashlex stores heredoc content in nested RedirectNode
+    objects, and the top-level part.pos doesn't include the heredoc content positions.
+    """
+    max_pos = current_max
+
+    # Check if this node has a heredoc
+    if hasattr(node, "heredoc") and node.heredoc:
+        heredoc_end = node.heredoc.pos[1]
+        max_pos = max(max_pos, heredoc_end)
+
+    # Recursively check child nodes
+    if hasattr(node, "parts"):
+        for part in node.parts:
+            max_pos = max(max_pos, _find_max_heredoc_pos(part, max_pos))
+
+    if hasattr(node, "list"):
+        for item in node.list:
+            max_pos = max(max_pos, _find_max_heredoc_pos(item, max_pos))
+
+    return max_pos
+
+
+# bashlex tokenizes ``time`` as a reserved word but its grammar action for it is
+# a ``NotImplementedError`` stub, so any script containing ``time <cmd>`` fails
+# to parse. ``TIME`` is an ordinary word to both bash and bashlex, and has the
+# same length, so node positions from the masked parse index the real script.
+# Occurrences that are not the keyword (``$time``, ``time=1``, ``echo time``,
+# heredoc delimiters and their terminators) become the same construct spelled
+# differently, which leaves the parse tree shape unchanged.
+_TIME_KEYWORD_RE = re.compile(r"\btime\b")
+
+
+def _mask_time_keyword(script: str) -> str:
+    """Length-preserving rewrite of ``time`` so bashlex can parse the script."""
+    return _TIME_KEYWORD_RE.sub("TIME", script)
+
+
+def _bash_syntax_error(script: str, fallback: str) -> str | None:
+    """Ask bash itself whether ``script`` is syntactically valid.
+
+    bashlex rejects valid bash it does not model (``[[ ]]``, ``$(( ))``,
+    ``<( )``, ``time`` mid-pipeline, ...), so its parse error alone cannot
+    distinguish "unsupported" from "broken". ``bash -n`` parses without
+    executing anything and is the authority.
+
+    Returns None when bash accepts the script, bash's own error message when it
+    rejects it, and ``fallback`` when the check could not run. Bash is resolved
+    the same way :class:`ShellSession` launches it (via PATH), so the split
+    boundary validation also applies on Windows/Msys2-Git-Bash — otherwise the
+    new splitter would be silently disabled on that supported path and lose
+    stop-on-failure for extended-syntax scripts.
+    """
+    bash = shutil.which("bash")
+    if bash is None:
+        return fallback
+    try:
+        result = subprocess.run(
+            [bash, "-n"],
+            input=script,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return fallback
+    if result.returncode == 0:
+        return None
+    # "/usr/bin/bash: line 2: syntax error ..." -> "line 2: syntax error ..."
+    message = re.sub(r"^\S*bash: ", "", result.stderr.strip(), flags=re.MULTILINE)
+    return message or fallback
+
+
+def split_commands(script: str) -> list[str]:
+    """Split at top-level newlines, preserving Bash lists and original source.
+
+    Tree-sitter spans include heredoc bodies and use byte offsets, so slicing
+    UTF-8 source preserves quoted delimiters and non-ASCII text without rewrites.
+    Keep bashlex as a compatibility fallback for one release: tree-sitter's
+    error recovery must never turn an incomplete tree into executable fragments.
+    """
+    source = script.encode("utf-8")
+    root = _parse_bash(source)
+    if root.has_error:
+        return _split_commands_bashlex(script)
+
+    commands: list[str] = []
+    start: int | None = None
+    end = 0
+    after_comment = False
+    for node in root.children:
+        if node.type == "comment":
+            after_comment = True
+            continue
+        # Semicolon/background lists stay together on the same logical line.
+        # Newlines inside compound statements, pipelines, and heredocs are
+        # already contained by their top-level node.
+        gap = source[end : node.start_byte]
+        if not after_comment:
+            gap = gap.replace(b"\\\n", b"")
+        if start is not None and b"\n" in gap:
+            commands.append(source[start:end].decode("utf-8"))
+            start = None
+        if start is None:
+            start = node.start_byte
+        end = node.end_byte
+        after_comment = False
+    if start is not None:
+        commands.append(source[start:end].decode("utf-8"))
+
+    # A clean tree is not proof of correct Bash boundaries. In particular,
+    # tree-sitter can parse `time { ... }` as ordinary words, with no ERROR
+    # node. Let Bash reject incomplete fragments before they reach the shell.
+    if len(commands) > 1 and any(
+        _bash_syntax_error(command, fallback="Cannot validate split boundary")
+        is not None
+        for command in commands
+    ):
+        return _split_commands_bashlex(script)
+    return commands
+
+
+def _split_commands_bashlex(script: str) -> list[str]:
+    """Legacy parser retained temporarily for tree-sitter grammar gaps."""
+    import bashlex
+
+    # Preprocess script to handle quoted heredoc delimiters that bashlex can't parse
+    processed_script = _preprocess_quoted_heredocs(script)
+
+    try:
+        parts = bashlex.parse(_mask_time_keyword(processed_script))
+    except NotImplementedError as e:
+        # bashlex stubs out grammar it never implemented (select, coproc,
+        # [[ ]], arithmetic expansion, ...). That is valid bash, not a syntax
+        # error: run the script whole and let bash parse it. Splitting only
+        # affects per-command stdin redirection and stop-on-failure between
+        # top-level commands; permission checks never depend on it.
+        logger.debug(
+            "bashlex does not support a construct in this script, "
+            "running it as a single command: %s",
+            e,
+        )
+        return [script]
+    except Exception as e:
+        # bashlex also raises ParsingError on valid bash it does not model
+        # (``ls | time wc``, process substitution). bash decides; a real
+        # syntax error fails fast with bash's message instead of hanging.
+        bash_error = _bash_syntax_error(script, fallback=str(e))
+        if bash_error is None:
+            logger.debug(
+                "bashlex cannot parse script that bash accepts, "
+                "running it as a single command: %s",
+                e,
+            )
+            return [script]
+        raise ValueError(
+            f"Shell syntax error: {bash_error}\n"
+            f"Please fix the syntax or use a different approach."
+        ) from e
+
+    commands = []
+    for part in parts:
+        if part.kind == "command":
+            # A heredoc body is stored on the redirect node, outside the
+            # command's own span. When another redirect follows the heredoc
+            # operator (``cat <<EOF > out``) the body would be dropped and
+            # the shell left waiting for a terminator; slice through it.
+            max_pos = _find_max_heredoc_pos(part, part.pos[1])
+            if max_pos > part.pos[1]:
+                commands.append(processed_script[part.pos[0] : max_pos])
+                continue
+            command_parts = []
+            for word in part.parts:
+                start, end = word.pos
+                command_parts.append(processed_script[start:end])
+            command = " ".join(command_parts)
+            commands.append(command)
+        elif part.kind in ["function", "pipeline", "list", "compound"]:
+            # Find the maximum position including heredoc content
+            max_pos = _find_max_heredoc_pos(part, part.pos[1])
+            commands.append(processed_script[part.pos[0] : max_pos])
+        else:
+            logger.warning(
+                f"Unknown shell script part of kind '{part.kind}', hoping this works"
+            )
+            commands.append(processed_script[part.pos[0] : part.pos[1]])
+
+    # Convert back to original heredoc syntax if we modified it
+    return [_restore_quoted_heredocs(cmd, script) for cmd in commands]
+
+
+def _preprocess_quoted_heredocs(script: str) -> str:
+    """Convert quoted heredoc delimiters to unquoted ones for bashlex parsing."""
+    # Match heredoc operators with quoted delimiters: <<'DELIMITER' or <<"DELIMITER"
+    # Allow optional whitespace between << and the quoted delimiter
+    heredoc_pattern = re.compile(r'<<\s*(["\'])([^"\'\s]+)\1')
+    return heredoc_pattern.sub(r"<<\2", script)
+
+
+def _restore_quoted_heredocs(command: str, original_script: str) -> str:
+    """Restore quoted heredoc delimiters in the processed command."""
+    # If the original script had quoted heredocs, restore them
+    # Allow optional whitespace between << and the quoted delimiter
+    heredoc_pattern = re.compile(r'<<\s*(["\'])([^"\'\s]+)\1')
+    original_matches = heredoc_pattern.findall(original_script)
+
+    if not original_matches:
+        return command
+
+    # Replace unquoted delimiters back to quoted ones
+    for quote, delimiter in original_matches:
+        unquoted_pattern = f"<<{delimiter}"
+        quoted_replacement = f"<<{quote}{delimiter}{quote}"
+        command = command.replace(unquoted_pattern, quoted_replacement)
+
+    return command
+
+
+tool = ToolSpec(
+    name="shell",
+    desc="Executes shell commands.",
+    instructions=instructions,
+    instructions_format=instructions_format,
+    examples=examples,
+    execute=execute_shell,
+    block_types=["shell"],
+    parameters=[
+        Parameter(
+            name="command",
+            type="string",
+            description="The shell command with arguments to execute.",
+            required=True,
+        ),
+        Parameter(
+            name="background",
+            type="boolean",
+            description="Run the whole tool call as a background job.",
+            required=False,
+        ),
+    ],
+    # Register shell allowlist hook with high priority (10)
+    # This auto-confirms allowlisted commands before CLI/server hooks (priority 0)
+    hooks={
+        "allowlist": ("tool.confirm", shell_allowlist_hook, 10),
+        "background_completion": ("loop.continue", background_job_completion_hook, 0),
+        "session_end": ("session.end", _session_end_shell_cleanup, 0),
+    },
+    hints=frozenset({"code-exec", "destructive"}),
+)
+__doc__ = tool.get_doc(__doc__)

@@ -1,0 +1,2331 @@
+from pathlib import Path
+
+from gptme.codeblock import Codeblock, _extract_codeblocks
+
+EXAMPLES_DIR = Path(__file__).parent / "data"
+
+
+def test_extract_codeblocks_basic():
+    markdown = """
+Some text
+
+```python
+def hello():
+    print("Hello, World!")
+```
+
+More text
+"""
+    assert Codeblock.iter_from_markdown(markdown) == [
+        Codeblock("python", 'def hello():\n    print("Hello, World!")')
+    ]
+
+
+def test_extract_codeblocks_multiple():
+    markdown = """
+```java
+public class Main {
+    public static void main(String[] args) {
+        System.out.println("Hello, Java!");
+    }
+}
+```
+
+Some text
+
+```python
+def greet(name):
+    return f"Hello, {name}!"
+```
+"""
+    assert Codeblock.iter_from_markdown(markdown) == [
+        Codeblock(
+            "java",
+            'public class Main {\n    public static void main(String[] args) {\n        System.out.println("Hello, Java!");\n    }\n}',
+        ),
+        Codeblock("python", 'def greet(name):\n    return f"Hello, {name}!"'),
+    ]
+
+
+def test_extract_codeblocks_nested():
+    markdown = """
+```python
+def print_readme():
+    print('''Usage:
+
+```javascript
+callme()
+```
+
+''')
+```
+
+"""
+    assert Codeblock.iter_from_markdown(markdown) == [
+        Codeblock(
+            "python",
+            "def print_readme():\n    print('''Usage:\n\n```javascript\ncallme()\n```\n\n''')",
+        )
+    ]
+
+
+def test_extract_codeblocks_unfinished_nested():
+    markdown = """
+```python
+def print_readme():
+    print('''Usage:
+```javascript
+
+"""
+    assert Codeblock.iter_from_markdown(markdown) == []
+
+
+def test_extract_codeblocks_empty():
+    assert Codeblock.iter_from_markdown("") == []
+
+
+def test_extract_codeblocks_text_only():
+    assert (
+        Codeblock.iter_from_markdown("Just some regular text\nwithout any code blocks.")
+        == []
+    )
+
+
+def test_extract_codeblocks_no_language():
+    markdown = """
+```
+def hello():
+    print("Hello, World!")
+```
+"""
+    assert Codeblock.iter_from_markdown(markdown) == [
+        Codeblock("", 'def hello():\n    print("Hello, World!")')
+    ]
+
+
+def test_extract_codeblocks_markdown_with_nested_no_langtag():
+    """
+    Test that markdown blocks containing nested codeblocks without language tags
+    are parsed correctly. This addresses the issue where ``` followed by content
+    was mistaken for a closing tag instead of an opening tag.
+    """
+    markdown = """
+```markdown
+# README
+
+Installation:
+
+```
+npm install
+```
+
+Usage:
+
+```
+node app.js
+```
+
+Done!
+```
+"""
+    # Should parse as single markdown block, not get cut off at first ```
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert len(blocks) == 1
+    assert blocks[0].lang == "markdown"
+
+    # Should contain all the nested content
+    content = blocks[0].content
+    assert "npm install" in content
+    assert "node app.js" in content
+    assert "Done!" in content
+
+
+def test_extract_codeblocks_consecutive():
+    """Test that consecutive codeblocks are both extracted."""
+    markdown = """```python
+print("first")
+```
+```bash
+echo "second"
+```"""
+    codeblocks = list(_extract_codeblocks(markdown))
+    assert len(codeblocks) == 2
+    assert codeblocks[0].lang == "python"
+    assert codeblocks[0].content == 'print("first")'
+    assert codeblocks[0].start == 0
+    assert codeblocks[1].lang == "bash"
+    assert codeblocks[1].content == 'echo "second"'
+    assert codeblocks[1].start == 3
+
+
+def test_extract_codeblocks_tooluse_then_output_block():
+    """Tooluse + prose + output fence must not swallow into one command.
+
+    Regression for gptme/gptme#3697: at depth 1 the nested-fence lookahead
+    treated the shell closer as a nested opener because a later bare fence
+    had non-blank content after it. The shell tool then received the prose
+    and inner fences as part of the command.
+    """
+    markdown = """```shell
+echo hello
+```
+The exact output is:
+
+```
+hello
+```
+"""
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert len(blocks) == 2, f"expected 2 blocks, got {len(blocks)}: {blocks!r}"
+    assert blocks[0] == Codeblock("shell", "echo hello")
+    assert blocks[1] == Codeblock("", "hello")
+
+
+def test_extract_codeblocks_ipython_then_output_block():
+    """Same swallow hazard for the ipython tool (also executed)."""
+    markdown = """```ipython
+1 + 1
+```
+The exact output is:
+
+```
+2
+```
+"""
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert len(blocks) == 2, f"expected 2 blocks, got {len(blocks)}: {blocks!r}"
+    assert blocks[0] == Codeblock("ipython", "1 + 1")
+    assert blocks[1] == Codeblock("", "2")
+
+
+def test_extract_codeblocks_shell_heredoc_with_embedded_fence():
+    """Shell block containing a heredoc whose body has literal fence lines must
+    not be truncated at the embedded fence.
+
+    Regression for gptme/gptme#3703: the EXEC_LANGS bare-fence-is-always-a-closer
+    fix broke any shell command that writes a markdown file via heredoc, because the
+    parser terminated the shell block at the first ``` inside the heredoc body.
+    """
+    markdown = """```shell
+cat << 'EOF' > file.md
+```
+some markdown
+```
+EOF
+echo done
+```
+"""
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert len(blocks) == 1, f"expected 1 block, got {len(blocks)}: {blocks!r}"
+    assert blocks[0] == Codeblock(
+        "shell", "cat << 'EOF' > file.md\n```\nsome markdown\n```\nEOF\necho done"
+    )
+
+
+def test_extract_codeblocks_shell_heredoc_unquoted_terminator():
+    """Same heredoc case with an unquoted terminator (<<EOF vs <<'EOF')."""
+    markdown = """```shell
+cat <<EOF > readme.md
+```
+content
+```
+EOF
+```
+"""
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert len(blocks) == 1, f"expected 1 block, got {len(blocks)}: {blocks!r}"
+    expected_content = "cat <<EOF > readme.md\n```\ncontent\n```\nEOF"
+    assert blocks[0] == Codeblock("shell", expected_content)
+
+
+def test_extract_codeblocks_shell_heredoc_punctuated_terminator():
+    """Heredoc terminator words aren't restricted to \\w (bash allows any
+    unquoted word without whitespace, e.g. hyphens). Regression for the
+    Greptile P1 on gptme/gptme#3703: ``\\w+`` failed to match ``END-TAG``,
+    so the embedded fence closed the block early.
+    """
+    markdown = """```shell
+cat << 'END-TAG' > file.md
+```
+some markdown
+```
+END-TAG
+```
+"""
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert len(blocks) == 1, f"expected 1 block, got {len(blocks)}: {blocks!r}"
+    assert blocks[0] == Codeblock(
+        "shell", "cat << 'END-TAG' > file.md\n```\nsome markdown\n```\nEND-TAG"
+    )
+
+
+def test_extract_codeblocks_shell_comment_with_lt_lt_not_a_heredoc():
+    """A ``<<`` inside a ``#`` comment must not be treated as a heredoc
+    operator. Regression for the Greptile P1 on gptme/gptme#3703: the
+    heredoc scanner didn't know about comments, so inert ``<<`` text in a
+    comment falsely opened heredoc state, re-enabling the depth-1
+    look-ahead and absorbing the following prose/output blocks into the
+    command.
+    """
+    markdown = """```shell
+# see the << operator docs
+echo hi
+```
+prose after
+
+```
+output here
+```
+"""
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert blocks == [
+        Codeblock("shell", "# see the << operator docs\necho hi"),
+        Codeblock("", "output here"),
+    ]
+
+
+def test_extract_codeblocks_shell_escaped_quote_not_a_heredoc():
+    """A backslash-escaped quote inside a double-quoted string must not
+    desync the quote tracker. Regression for the Greptile P1 on
+    gptme/gptme#3703: the scanner treated ``\\"`` as closing the string,
+    so a later unquoted-looking ``<<`` inside the (still-open) string
+    falsely opened heredoc state and absorbed the following prose/output
+    blocks into the command.
+    """
+    markdown = """```shell
+echo "value \\" << not-a-heredoc"
+```
+prose after
+
+```
+output here
+```
+"""
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert blocks == [
+        Codeblock("shell", 'echo "value \\" << not-a-heredoc"'),
+        Codeblock("", "output here"),
+    ]
+
+
+def test_extract_codeblocks_shell_herestring_is_not_a_heredoc():
+    """A ``<<<`` here-string takes one inline value and never opens a
+    multi-line body. Regression for the Greptile P1 on gptme/gptme#3703:
+    the terminator regex matched the third ``<`` as a bogus terminator
+    (e.g. ``"<"``), so heredoc state never closed and the real closing
+    fence was absorbed as a nested opener.
+    """
+    markdown = """```shell
+cat <<< "hello"
+```
+prose after
+
+```
+output here
+```
+"""
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert blocks == [
+        Codeblock("shell", 'cat <<< "hello"'),
+        Codeblock("", "output here"),
+    ]
+
+
+def test_extract_codeblocks_shell_heredoc_backslash_escaped_terminator():
+    """``<<\\EOF`` (backslash-escaped, unquoted) uses the plain word ``EOF``
+    as its terminator, same as ``<<EOF`` and ``<<'EOF'``. Regression for the
+    Greptile P1 on gptme/gptme#3703: the terminator regex captured the
+    backslash as part of the word (``"\\\\EOF"``), which never matched the
+    real closing line ``EOF``, so heredoc state persisted forever and
+    swallowed the rest of the message into the command.
+    """
+    markdown = """```shell
+cat <<\\EOF > file.md
+```
+some markdown
+```
+EOF
+```
+"""
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert len(blocks) == 1, f"expected 1 block, got {len(blocks)}: {blocks!r}"
+    assert blocks[0] == Codeblock(
+        "shell", "cat <<\\EOF > file.md\n```\nsome markdown\n```\nEOF"
+    )
+
+
+def test_extract_codeblocks_ipython_arithmetic_shift_is_not_a_heredoc():
+    """An unquoted ``<<`` that's actually an arithmetic left-shift (e.g.
+    ipython ``x << 2``) must not permanently wedge heredoc state open.
+
+    Regression for the bob-ai-review P2 on gptme/gptme#3703: a phantom
+    terminator (``"2"``) that never appears alone on a later line used to
+    stay "open" for the rest of the message, so the real closing fence was
+    absorbed as a nested opener and the following prose/output blocks were
+    swallowed into the ipython command.
+    """
+    markdown = """```ipython
+x = 1 << 2
+```
+prose after
+
+```
+output here
+```
+"""
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert blocks == [
+        Codeblock("ipython", "x = 1 << 2"),
+        Codeblock("", "output here"),
+    ]
+
+
+def test_extract_codeblocks_ipython_nonnumeric_shift_is_not_a_heredoc():
+    """An ipython ``<<`` with a nonnumeric operand (e.g. ``x << marker``) must
+    not activate heredoc state even when ``marker`` appears alone on a later line.
+
+    IPython/Python has no heredoc syntax — ``<<`` is always bitwise left-shift.
+    Regression for gptme/gptme#3703 (Greptile P1 "Nonnumeric shifts mimic heredocs"):
+    before the _SHELL_LANGS fix, the heredoc scanner ran on ipython blocks and
+    returned ``"marker"`` as a candidate terminator; when ``marker`` appeared
+    standalone in the prose, heredoc state opened and the actual closing fence
+    was treated as a nested opener, swallowing the output block.
+    """
+    markdown = """```ipython
+x << marker
+result = x
+```
+prose after
+
+marker
+```
+output here
+```
+"""
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert blocks == [
+        Codeblock("ipython", "x << marker\nresult = x"),
+        Codeblock("", "output here"),
+    ]
+
+
+def test_extract_codeblocks_ipython_triple_double_quote_contains_fence():
+    """A bare fence inside an IPython triple-double-quoted string is literal content.
+
+    Regression for gptme/gptme#3704: before this fix the closing ``` of the
+    triple-quoted string was treated as the block closer, so the ipython command
+    was truncated and the trailing print + closing fence were lost.
+    """
+    markdown = '''```ipython
+text = """
+```
+some markdown
+```
+"""
+print(text)
+```
+'''
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert blocks == [
+        Codeblock(
+            "ipython",
+            'text = """\n```\nsome markdown\n```\n"""\nprint(text)',
+        )
+    ]
+
+
+def test_extract_codeblocks_ipython_triple_single_quote_contains_fence():
+    """A bare fence inside an IPython triple-single-quoted string is literal content."""
+    markdown = """```ipython
+text = '''
+```
+markdown here
+```
+'''
+result = text
+```
+"""
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert blocks == [
+        Codeblock(
+            "ipython",
+            "text = '''\n```\nmarkdown here\n```\n'''\nresult = text",
+        )
+    ]
+
+
+def test_extract_codeblocks_ipython_triple_quote_single_line_does_not_keep_open():
+    """A triple-quoted string that opens and closes on the same line leaves state clean.
+
+    After ``x = \"\"\"hello\"\"\"`` the parser must NOT treat subsequent bare fences
+    as inside a triple-quoted string — the string closed on the same line.
+    """
+    markdown = '''```ipython
+x = """hello"""
+```
+output
+```
+'''
+    blocks = Codeblock.iter_from_markdown(markdown)
+    # The ipython block closes at the first bare ```, then "output" is prose and
+    # the trailing ``` opens a block with no closing fence → only the ipython
+    # block is emitted.
+    assert blocks == [
+        Codeblock("ipython", 'x = """hello"""'),
+    ]
+
+
+def test_scan_ipython_ordinary_string_hides_triple_quotes():
+    """Ordinary quoted strings must not be mistaken for triple-quote openers."""
+    from gptme.codeblock import _scan_ipython_triple_quote
+
+    assert _scan_ipython_triple_quote('value = \'"""\'', False, False) == (
+        False,
+        False,
+        False,
+        False,
+    )
+    assert _scan_ipython_triple_quote('prefix = "#"; text = """', False, False) == (
+        True,
+        False,
+        False,
+        False,
+    )
+    assert _scan_ipython_triple_quote('x = """hello"""', False, False) == (
+        False,
+        False,
+        False,
+        False,
+    )
+    assert _scan_ipython_triple_quote("value = \"'''\"", False, False) == (
+        False,
+        False,
+        False,
+        False,
+    )
+
+
+def test_scan_ipython_backslash_continued_ordinary_string_hides_triple():
+    """A backslash-continued ordinary string must not open triple-quote state.
+
+    Regression for gptme/gptme#3773 (Greptile P1): after ``s = 'abc \\`` the
+    next line's ``\"\"\"`` is still ordinary-string content.
+    """
+    from gptme.codeblock import _scan_ipython_triple_quote
+
+    # Trailing unescaped backslash keeps ordinary-single state.
+    assert _scan_ipython_triple_quote("s = 'abc \\", False, False) == (
+        False,
+        False,
+        True,
+        False,
+    )
+    # Carried ordinary-single makes ``"""`` literal; no closer → reset after line.
+    assert _scan_ipython_triple_quote('"""', False, False, True, False) == (
+        False,
+        False,
+        False,
+        False,
+    )
+    # Same, but the continuation line closes the ordinary string.
+    assert _scan_ipython_triple_quote('"""\'', False, False, True, False) == (
+        False,
+        False,
+        False,
+        False,
+    )
+    # Unterminated ordinary string WITHOUT continuation must not persist.
+    assert _scan_ipython_triple_quote("s = 'hello", False, False) == (
+        False,
+        False,
+        False,
+        False,
+    )
+    # Even number of trailing backslashes is a literal backslash, not continuation.
+    assert _scan_ipython_triple_quote("s = 'abc \\\\", False, False) == (
+        False,
+        False,
+        False,
+        False,
+    )
+
+
+def test_scan_ipython_escaped_quote_in_ordinary_string_does_not_desync():
+    """A backslash-escaped quote inside an ordinary string must not close it.
+
+    Consensus-gate finding on gptme/gptme#3773 claimed ``\"`` would close
+    ordinary-double state prematurely. The scanner already skips the escaped
+    character; this pins that so a later ``\"\"\"`` still opens triple-double.
+    """
+    from gptme.codeblock import _scan_ipython_triple_quote
+
+    # ``"a\""`` is a complete ordinary string containing ``a"``. Then ``"""``
+    # opens triple-double.
+    assert _scan_ipython_triple_quote(r'x = "a\""; y = """', False, False) == (
+        True,
+        False,
+        False,
+        False,
+    )
+    assert _scan_ipython_triple_quote(r"x = 'a\''; y = '''", False, False) == (
+        False,
+        True,
+        False,
+        False,
+    )
+    # Escaped quote with more content before the real closer.
+    assert _scan_ipython_triple_quote(r'x = "hello \" world"', False, False) == (
+        False,
+        False,
+        False,
+        False,
+    )
+
+
+def test_extract_codeblocks_ipython_ordinary_string_does_not_open_triple():
+    """Ordinary quoted strings must not be mistaken for triple-quote openers.
+
+    Regression for gptme/gptme#3773 (Greptile P1): ``value = '\"\"\"'`` used
+    to open triple-double state, so the real block closer was retained as
+    source and later Markdown was swallowed.
+    """
+    markdown = '''```ipython
+value = '"""'
+print(value)
+```
+
+```output
+"""
+```
+'''
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert blocks == [
+        Codeblock("ipython", 'value = \'"""\'\nprint(value)'),
+        Codeblock("output", '"""'),
+    ]
+
+
+def test_extract_codeblocks_ipython_hash_in_string_does_not_hide_triple_opener():
+    """A ``#`` inside an ordinary string must not stop the triple-quote scan.
+
+    Regression for gptme/gptme#3773 (Greptile P1): ``prefix = "#"; text = \"\"\"``
+    used to treat ``#`` as a comment, never see the real opener, then close
+    the IPython block at the first fence inside that string.
+    """
+    markdown = '''```ipython
+prefix = "#"; text = """
+```
+inside
+```
+"""
+print(text)
+```
+'''
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert blocks == [
+        Codeblock(
+            "ipython",
+            'prefix = "#"; text = """\n```\ninside\n```\n"""\nprint(text)',
+        ),
+    ]
+
+
+def test_extract_codeblocks_ipython_continued_ordinary_string_hides_triple():
+    """A backslash-continued ordinary string must not open triple-quote state.
+
+    Regression for gptme/gptme#3773 (Greptile P1): after ``s = 'abc \\`` the
+    next line's ``\"\"\"`` is still ordinary-string content. Treating it as a
+    triple-double opener used to retain the real closer as source (the IPython
+    block was never emitted) and swallow later Markdown.
+    """
+    markdown = (
+        '```ipython\ns = \'abc \\\n"""\'\nprint(s)\n```\n\n```output\nlater\n```\n'
+    )
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert blocks == [
+        Codeblock("ipython", 's = \'abc \\\n"""\'\nprint(s)'),
+        Codeblock("output", "later"),
+    ]
+
+
+def test_extract_codeblocks_ipython_escaped_quote_in_ordinary_string():
+    """An escaped quote inside an ordinary string must not desync fence matching.
+
+    If ``\"`` closed ordinary-double state, the trailing ``"`` of ``"a\\""``
+    would open a new string and a later triple-quoted fence would be treated
+    as a real closer (or the block would never be emitted).
+    """
+    markdown = '''```ipython
+x = "a\\""
+y = """
+```
+inside
+```
+"""
+print(y)
+```
+'''
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert blocks == [
+        Codeblock(
+            "ipython",
+            'x = "a\\""\ny = """\n```\ninside\n```\n"""\nprint(y)',
+        ),
+    ]
+
+
+def test_extract_codeblocks_ipython_tagged_fence_inside_triple_quote_is_literal():
+    """A language-tagged fence inside a triple-quoted string is literal content.
+
+    Regression for gptme/gptme#3773 (Greptile P1): `` ```python `` inside
+    ``\"\"\"...\"\"\"`` incremented nesting_depth, but the matching bare
+    closer was treated as literal, so the IPython block was never emitted.
+    """
+    markdown = '''```ipython
+text = """
+```python
+print("hi")
+```
+"""
+print(text)
+```
+'''
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert blocks == [
+        Codeblock(
+            "ipython",
+            'text = """\n```python\nprint("hi")\n```\n"""\nprint(text)',
+        ),
+    ]
+
+
+def test_extract_codeblocks_ipython_fence_outside_triple_quote_still_closes():
+    """A bare fence that is NOT inside a triple-quoted string still closes the block."""
+    markdown = """```ipython
+x = 1 + 1
+```
+prose after
+```
+"""
+    blocks = Codeblock.iter_from_markdown(markdown)
+    # The ipython block closes correctly at the bare ```.  "prose after" is
+    # prose; the trailing ``` opens a block with no closing fence so it is not
+    # emitted.
+    assert blocks == [
+        Codeblock("ipython", "x = 1 + 1"),
+    ]
+
+
+def test_extract_codeblocks_shift_operand_alone_is_not_a_heredoc():
+    """A shift operand that later appears alone on a line must not mint a
+    phantom heredoc terminator and swallow the closing fence.
+
+    Regression for gptme/gptme#3703: ``x << 2`` used to return ``"2"`` as a
+    candidate heredoc terminator; when a standalone ``2`` appeared within the
+    200-line confirmation window, heredoc state stayed open past the real
+    closing fence and the following block was absorbed into the shell command.
+    """
+    markdown = """```shell
+x << 2
+echo "result"
+```
+prose after
+
+2
+```
+output here
+```
+"""
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert blocks == [
+        Codeblock("shell", 'x << 2\necho "result"'),
+        Codeblock("", "output here"),
+    ]
+
+
+def test_extract_codeblocks_arithmetic_expansion_shift_is_not_a_heredoc():
+    """A ``<<`` inside ``$((...))`` arithmetic expansion is a bit-shift, not a
+    heredoc, even when its operand appears alone on a later line.
+
+    Regression for gptme/gptme#3703: ``$((1 << 3))`` used to mint ``"3))"`` as
+    a phantom terminator, and a standalone ``3`` in following content confirmed
+    it, swallowing the closing fence.
+    """
+    markdown = """```shell
+result=$((1 << 3))
+echo "done"
+```
+prose
+
+3
+```
+output here
+```
+"""
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert blocks == [
+        Codeblock("shell", 'result=$((1 << 3))\necho "done"'),
+        Codeblock("", "output here"),
+    ]
+
+
+def test_extract_codeblocks_concatenated_adjacent_fences():
+    """Recover when a closing fence and the next opening fence are concatenated."""
+    markdown = """```shell
+pwd && ls -la
+``````shell
+find /tmp/x -maxdepth 2 -type f | sort
+```"""
+    codeblocks = Codeblock.iter_from_markdown(markdown)
+    assert len(codeblocks) == 2
+    assert codeblocks[0] == Codeblock("shell", "pwd && ls -la")
+    assert codeblocks[1] == Codeblock("shell", "find /tmp/x -maxdepth 2 -type f | sort")
+
+
+def test_extract_codeblocks_streaming_interrupted():
+    """
+    Test case based on real interruption during streaming.
+
+    Reproduces issue where bare ``` after descriptive text was incorrectly
+    treated as closing delimiter instead of opening a nested code block.
+    """
+    content = (EXAMPLES_DIR / "example-interrupted.txt").read_text(encoding="utf-8")
+
+    # Extract just the markdown part (after "create a journal entry")
+    # This should parse as a single append block with nested code blocks inside
+    start_marker = "```append journal/2025-10-01.md"
+    start_idx = content.find(start_marker)
+    assert start_idx != -1, "Could not find append block in example"
+
+    markdown = content[start_idx:]
+
+    # Should extract one append block
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1, f"Expected 1 block, got {len(blocks)}"
+    assert blocks[0].lang == "append journal/2025-10-01.md"
+
+    # The content should include all the nested parts
+    content_text = blocks[0].content
+    assert "**Output Format:**" in content_text
+    assert "Journal Entry" in content_text
+
+
+def test_extract_codeblocks_nested_without_lang():
+    """
+    Test that nested code blocks without language tags are handled correctly.
+
+    This reproduces the streaming interruption issue where ``` after descriptive
+    text should open a nested block, not close the outer block.
+    """
+    # Build the test case programmatically to avoid triggering the bug
+    fence = "```"
+
+    # This is what should be parsed correctly:
+    # An append block containing text followed by a nested code block example
+    markdown = f"""{fence}append journal/entry.md
+# Journal Entry
+
+**Output Format:**
+{fence}
+key: value
+{fence}
+
+Done!
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+
+    # Should extract one append block
+    assert len(blocks) == 1, f"Expected 1 block, got {len(blocks)}"
+    assert blocks[0].lang == "append journal/entry.md"
+
+    # The content should include ALL parts including the nested block and "Done!"
+    content = blocks[0].content
+    assert "**Output Format:**" in content
+    assert "key: value" in content
+    assert "Done!" in content, (
+        "Content was cut off prematurely - nested block was treated as closing delimiter"
+    )
+
+
+def test_extract_codeblocks_incomplete_streaming():
+    """
+    Test parsing incomplete content as would happen during streaming.
+
+    When content ends with ``` after descriptive text, but more content
+    is expected, the parser should not extract an incomplete block.
+    """
+    fence = "```"
+
+    # Simulate streaming: content stops mid-block after a bare ```
+    incomplete_markdown = f"""{fence}append journal/entry.md
+# Journal Entry
+
+**Output Format:**
+{fence}"""
+
+    # During streaming, this appears incomplete - we shouldn't extract it yet
+    # With streaming=True, requires blank line after ``` to confirm closure
+    blocks = list(_extract_codeblocks(incomplete_markdown, streaming=True))
+
+    # Should not extract incomplete blocks during streaming
+    assert len(blocks) == 0, "Should not extract incomplete block during streaming"
+
+    # But without streaming flag (completed message), should extract
+    blocks_complete = list(_extract_codeblocks(incomplete_markdown, streaming=False))
+    assert len(blocks_complete) == 1, "Should extract when message is complete"
+
+
+def test_streaming_parameter_comprehensive():
+    """
+    Comprehensive test for streaming parameter behavior.
+
+    Exec langs (shell, bash, python, …) have no triple-backtick syntax of
+    their own, so a bare ``` at depth 1 is *always* a closer — no blank-line
+    confirmation is required even in streaming mode.
+
+    Non-exec langs (markdown, text, …) still require a blank line to confirm
+    closure in streaming mode because a bare ``` could be the opening of an
+    inner nested block that isn't finished yet.
+
+    Tests:
+    - Exec lang, streaming=True, WITH blank line → extract
+    - Exec lang, streaming=True, WITHOUT blank line → extract (no confirmation needed)
+    - Exec lang, streaming=False → always extract
+    - Non-exec lang, streaming=True, WITH blank line → extract
+    - Non-exec lang, streaming=True, WITHOUT blank line → do NOT extract
+    """
+    fence = "```"
+
+    # ── Exec lang (shell) ──────────────────────────────────────────────────
+
+    markdown_exec_with_blank = f"""{fence}shell
+echo "hello"
+{fence}
+
+"""
+    markdown_exec_no_blank = f"""{fence}shell
+echo "hello"
+{fence}"""
+
+    # Case 1: Exec lang, streaming=True, WITH blank line → extract
+    blocks = list(_extract_codeblocks(markdown_exec_with_blank, streaming=True))
+    assert len(blocks) == 1, "Exec: should extract with blank line in streaming mode"
+    assert blocks[0].lang == "shell"
+    assert blocks[0].content == 'echo "hello"'
+
+    # Case 2: Exec lang, streaming=True, WITHOUT blank line → extract
+    # Shell has no nested ``` syntax; a bare fence at depth 1 is always a closer.
+    blocks = list(_extract_codeblocks(markdown_exec_no_blank, streaming=True))
+    assert len(blocks) == 1, (
+        "Exec: should extract without blank line in streaming mode "
+        "(bare fence is unambiguously a closer for exec langs)"
+    )
+    assert blocks[0].lang == "shell"
+    assert blocks[0].content == 'echo "hello"'
+
+    # Case 3: Exec lang, streaming=False → always extract
+    blocks = list(_extract_codeblocks(markdown_exec_no_blank, streaming=False))
+    assert len(blocks) == 1, "Exec: should extract in non-streaming mode"
+    assert blocks[0].lang == "shell"
+    assert blocks[0].content == 'echo "hello"'
+
+    # ── Non-exec lang (text) ───────────────────────────────────────────────
+
+    markdown_text_with_blank = f"""{fence}text
+hello
+{fence}
+
+"""
+    markdown_text_no_blank = f"""{fence}text
+hello
+{fence}"""
+
+    # Case 4: Non-exec lang, streaming=True, WITH blank line → extract
+    blocks = list(_extract_codeblocks(markdown_text_with_blank, streaming=True))
+    assert len(blocks) == 1, (
+        "Non-exec: should extract with blank line in streaming mode"
+    )
+    assert blocks[0].content == "hello"
+
+    # Case 5: Non-exec lang, streaming=True, WITHOUT blank line → do NOT extract
+    # A bare ``` could still be a nested opener whose body hasn't arrived yet.
+    blocks = list(_extract_codeblocks(markdown_text_no_blank, streaming=True))
+    assert len(blocks) == 0, (
+        "Non-exec: should NOT extract without blank line in streaming mode"
+    )
+
+
+def test_streaming_nested_blocks():
+    """
+    Test streaming behavior with nested code blocks.
+
+    Ensures that nested blocks don't cause premature extraction during streaming.
+    """
+    fence = "```"
+
+    # Case 1: Nested block without blank line during streaming
+    # Should NOT extract because the outer block isn't confirmed complete
+    nested_markdown = f"""{fence}save example.md
+# Example
+
+Usage:
+{fence}
+npm install
+{fence}
+
+Done!
+{fence}"""
+
+    # During streaming: should NOT extract without blank line
+    blocks = list(_extract_codeblocks(nested_markdown, streaming=True))
+    assert len(blocks) == 0, (
+        "Should NOT extract nested block during streaming without blank line"
+    )
+
+    # After completion: should extract
+    blocks = list(_extract_codeblocks(nested_markdown, streaming=False))
+    assert len(blocks) == 1, "Should extract nested block when complete"
+    assert "npm install" in blocks[0].content
+    assert "Done!" in blocks[0].content
+
+    # Case 2: Nested block WITH blank line during streaming
+    # Should extract because blank line confirms completion
+    nested_with_blank = f"""{fence}save example.md
+# Example
+
+Usage:
+{fence}
+npm install
+{fence}
+
+Done!
+{fence}
+
+"""
+
+    blocks = list(_extract_codeblocks(nested_with_blank, streaming=True))
+    assert len(blocks) == 1, (
+        "Should extract nested block with blank line during streaming"
+    )
+    assert "npm install" in blocks[0].content
+    assert "Done!" in blocks[0].content
+
+
+def test_extract_patch_codeblock_with_nested_backticks():
+    """
+    Test extraction of patch codeblocks containing nested triple backticks.
+
+    This reproduces an issue where patch blocks with code examples
+    inside them (using ```) were incorrectly parsed during streaming.
+    """
+    content = (EXAMPLES_DIR / "example-patch-codeblock.txt").read_text(encoding="utf-8")
+
+    # Add a blank line after the closing ``` to confirm block closure in streaming mode.
+    # (end-of-file-fixer strips trailing blank lines from the file, so we add it here)
+    content_with_blank = content + "\n"
+    blocks = list(_extract_codeblocks(content_with_blank, streaming=True))
+    assert len(blocks) == 1, (
+        f"Expected 1 patch block in streaming mode, got {len(blocks)}"
+    )
+
+    block = blocks[0]
+    assert block.lang.startswith("patch "), (
+        f"Expected patch block, got lang='{block.lang}'"
+    )
+
+    # The content should include all the patch markers and nested code blocks
+    assert "<<<<<<< ORIGINAL" in block.content
+    assert "=======" in block.content
+    assert ">>>>>>> UPDATED" in block.content
+    assert "```text" in block.content, "Should preserve nested code block markers"
+    assert block.content.count("```text") == 2, "Should have both text blocks"
+    assert "git grep" in block.content
+
+    # Test without blank line - should NOT extract in streaming mode
+    content_no_blank = content.rstrip()  # Remove trailing whitespace
+    blocks = list(_extract_codeblocks(content_no_blank, streaming=True))
+    assert len(blocks) == 0, (
+        f"Should not extract during streaming without blank line, got {len(blocks)} blocks"
+    )
+
+    # But should extract in non-streaming mode
+    blocks = list(_extract_codeblocks(content_no_blank, streaming=False))
+    assert len(blocks) == 1, (
+        f"Expected 1 patch block in non-streaming mode, got {len(blocks)}"
+    )
+
+
+def test_multiple_sequential_nested_blocks():
+    """
+    Test that multiple nested blocks with language tags are handled correctly.
+
+    When we close a nested block and return to depth 1, we should be able to
+    open a new nested block immediately after.
+    """
+    fence = "```"
+    markdown = f"""{fence}outer
+First content
+{fence}inner1
+nested content 1
+{fence}
+Between blocks
+{fence}inner2
+nested content 2
+{fence}
+Final content
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1, f"Expected 1 outer block, got {len(blocks)}"
+
+    content = blocks[0].content
+    # Should contain both nested blocks with their markers
+    assert "```inner1" in content
+    assert "nested content 1" in content
+    assert "```inner2" in content
+    assert "nested content 2" in content
+    assert "Between blocks" in content
+    assert "Final content" in content
+
+
+def test_nested_block_followed_by_content():
+    """
+    Test that content after a nested block is included in the outer block.
+
+    This is the key case that the depth > 1 heuristic fixes.
+    """
+    fence = "```"
+    markdown = f"""{fence}outer
+Before nested
+{fence}inner
+nested content
+{fence}
+After nested - this should be included!
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+
+    content = blocks[0].content
+    assert "Before nested" in content
+    assert "```inner" in content
+    assert "nested content" in content
+    assert "After nested - this should be included!" in content
+
+
+def test_bare_backticks_open_nested_at_depth_1():
+    """
+    Test that bare backticks CAN open nested blocks when at depth 1.
+
+    This documents the behavior where bare ``` followed by content
+    opens a nested block only when we're at the top level.
+    """
+    fence = "```"
+    markdown = f"""{fence}outer
+Some content
+{fence}
+This starts a nested block (bare backticks at depth 1)
+{fence}
+More content
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+
+    content = blocks[0].content
+    assert "Some content" in content
+    assert "This starts a nested block" in content
+    assert "More content" in content
+
+
+def test_mixed_nested_blocks():
+    """
+    Test mixing language-tagged and bare-backtick nested blocks.
+    """
+    fence = "```"
+    markdown = f"""{fence}outer
+{fence}python
+print("hello")
+{fence}
+Between
+{fence}
+Bare nested block
+{fence}
+After
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+
+    content = blocks[0].content
+    assert "```python" in content
+    assert 'print("hello")' in content
+    assert "Between" in content
+    assert "Bare nested block" in content
+    assert "After" in content
+
+
+def test_triple_nesting_preserved_as_content():
+    """
+    Test that triple nesting is preserved as content within the outer block.
+
+    When we have multiple levels of nesting, the parser correctly preserves
+    all nested blocks as content within the outermost block. The nested
+    blocks keep their markers (```lang) so they can be parsed separately
+    if needed.
+    """
+    fence = "```"
+    markdown = f"""{fence}level1
+{fence}level2
+{fence}level3
+innermost content
+{fence}
+level2 content
+{fence}
+level1 content
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+
+    # All nested levels are preserved as content with their markers
+    content = blocks[0].content
+    assert "```level2" in content
+    assert "```level3" in content
+    assert "innermost content" in content
+    assert "level2 content" in content
+    assert "level1 content" in content
+
+
+def test_consecutive_bare_nested_blocks():
+    """
+    Test that consecutive bare ``` nested blocks are preserved as content.
+
+    Multiple bare ``` blocks within an outer block are correctly preserved
+    as nested content, maintaining their structure for potential nested parsing.
+    """
+    fence = "```"
+    markdown = f"""{fence}outer
+{fence}
+First nested (bare)
+{fence}
+Second nested (bare)
+{fence}
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+
+    # All bare backtick nested blocks are preserved in the content
+    content = blocks[0].content
+    assert "First nested (bare)" in content
+    assert "Second nested (bare)" in content
+
+
+def test_ambiguous_bare_backticks():
+    """
+    Documents behavior with ambiguous bare backticks and blank lines.
+
+    When bare ``` is followed by blank lines and another ```, the parser
+    treats the first ``` as closing the outer block. This creates two
+    separate blocks rather than nested content.
+
+    Users should use language tags to disambiguate if they want nested blocks.
+    """
+    fence = "```"
+    markdown = f"""{fence}outer
+Content before
+
+{fence}
+
+{fence}
+
+Content after
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+
+    # The parser treats the middle ``` as closing, creating 2 blocks
+    assert len(blocks) == 2
+
+    # First block contains content before the first bare ```
+    assert blocks[0].lang == "outer"
+    assert "Content before" in blocks[0].content
+    assert "Content after" not in blocks[0].content
+
+    # Second block (bare) contains content after the second bare ```
+    assert blocks[1].lang == ""
+    assert "Content after" in blocks[1].content
+    assert "Content before" not in blocks[1].content
+
+
+def test_opening_tag_has_content_after():
+    """
+    Opening tags (```lang) should have content on the next line.
+    This helps distinguish opening from closing tags.
+    """
+    fence = "```"
+    markdown = f"""{fence}python
+print("hello")
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+    assert blocks[0].lang == "python"
+    assert 'print("hello")' in blocks[0].content
+
+
+def test_closing_tag_has_empty_line_after():
+    """
+    Closing tags (bare ```) should have empty line after or EOF.
+    This helps distinguish closing from opening tags.
+    """
+    fence = "```"
+    markdown = f"""{fence}outer
+Some content
+{fence}
+
+More text after blank line
+"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+    assert blocks[0].lang == "outer"
+    assert "Some content" in blocks[0].content
+    assert "More text after blank line" not in blocks[0].content
+
+
+def test_bare_backticks_followed_by_content_opens_nested():
+    """
+    When bare ``` is followed by content (no blank line), it opens a nested block.
+    This is the key heuristic Erik suggests.
+    """
+    fence = "```"
+    markdown = f"""{fence}outer
+Before nested
+{fence}
+This is nested content (no blank line before)
+{fence}
+After nested
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+    content = blocks[0].content
+    assert "Before nested" in content
+    assert "This is nested content" in content
+    assert "After nested" in content
+
+
+def test_bare_backticks_followed_by_blank_line_closes():
+    """
+    When bare ``` is followed by blank line, it closes the outer block.
+    This disambiguates from opening nested blocks.
+    """
+    fence = "```"
+    markdown = f"""{fence}outer
+Content
+{fence}
+
+This is outside the block
+"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+    assert "Content" in blocks[0].content
+    assert "This is outside the block" not in blocks[0].content
+
+
+def test_eof_after_closing_tag():
+    """
+    EOF after closing tag (```<EOF>) is valid.
+    No blank line needed at end of document.
+    """
+    fence = "```"
+    markdown = f"""{fence}python
+print("hello")
+{fence}"""  # EOF immediately after closing tag
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+    assert blocks[0].lang == "python"
+
+
+def test_streaming_case_incomplete_closing():
+    """
+    During streaming, incomplete closing might appear as bare ``` with EOF.
+    This should be treated as incomplete, not opening nested.
+    """
+    fence = "```"
+    markdown = f"""{fence}python
+print("incomplete")
+{fence}"""  # Streaming incomplete - no newline after closing
+
+    blocks = list(_extract_codeblocks(markdown))
+    # Should recognize as complete block, not incomplete nested
+    assert len(blocks) == 1
+    assert 'print("incomplete")' in blocks[0].content
+
+
+def test_nested_with_same_language_tag():
+    """
+    Nested blocks with the same language tag as outer block.
+    This can confuse parsers that track by language.
+    """
+    fence = "```"
+    markdown = f"""{fence}python
+def outer():
+    code = '''{fence}python
+def inner():
+    pass
+{fence}'''
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+    assert blocks[0].lang == "python"
+    assert "def outer()" in blocks[0].content
+    assert "def inner()" in blocks[0].content
+
+
+def test_bare_backticks_in_string_literals():
+    """
+    Triple backticks inside string literals shouldn't be treated as code block markers.
+    """
+    fence = "```"
+    markdown = f"""{fence}python
+text = '''
+{fence}
+This is just a string, not a code block
+{fence}
+'''
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+    assert "This is just a string" in blocks[0].content
+
+
+def test_incomplete_opening_tag_streaming():
+    """
+    During streaming, opening tag might be incomplete: ```py (no newline yet).
+    Should not treat as complete block.
+    """
+    fence = "```"
+    markdown = f"""{fence}py"""  # Incomplete - no newline, no content
+
+    blocks = list(_extract_codeblocks(markdown))
+    # Should not extract incomplete opening tag
+    assert len(blocks) == 0
+
+
+def test_indented_code_blocks():
+    """
+    Indented code blocks (4 spaces) vs fenced blocks.
+    Should only extract fenced blocks.
+    """
+    fence = "```"
+    markdown = f"""Regular text
+
+    # This is indented (4 spaces)
+    def foo():
+        pass
+
+{fence}python
+# This is fenced
+def bar():
+    pass
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1  # Only fenced block
+    assert "def bar()" in blocks[0].content
+    assert "def foo()" not in blocks[0].content
+
+
+def test_backticks_in_inline_code():
+    """
+    Single backtick inline code shouldn't interfere with triple backticks.
+    """
+    fence = "```"
+    markdown = f"""Use `code` inline.
+
+{fence}python
+x = `backtick`
+{fence}
+
+More `inline code`.
+"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+    assert "x = `backtick`" in blocks[0].content
+
+
+def test_save_with_structure_header_and_bare_backticks():
+    """
+    Common failure from autonomous run logs: save/append with content containing
+    headers like "**Structure:**" followed by bare backticks, which causes parser
+    to think tool is closing prematurely.
+
+    This represents a real failure pattern observed in production. The save would
+    succeed if the inner block used a langtag like ```text instead of bare ```.
+    """
+    fence = "```"
+    markdown = f"""{fence}save file.txt
+This is a long file with multiple sections.
+
+Here's some initial content that works fine.
+
+**Structure:**
+{fence}
+More content that should be included but gets cut off.
+
+## Another Section
+Even more content here.
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+    # Tool should include ALL content until the final closing fence
+    content = blocks[0].content
+    assert "This is a long file" in content
+    assert "Structure:" in content
+    assert "More content that should be included" in content
+    assert "Another Section" in content
+    assert "Even more content here" in content
+
+
+def test_save_with_structure_header_and_bare_backticks_streaming():
+    """
+    Streaming mode variant of test_save_with_structure_header_and_bare_backticks.
+
+    During streaming, the parser receives content incrementally and might see:
+    - "**Structure:**"
+    - "```"
+    And prematurely think "this closes the save block!" when it's actually
+    opening a nested example block.
+
+    In streaming mode, a blank line after the closing fence confirms completion.
+    This test verifies the parser correctly handles this pattern in streaming.
+    """
+    fence = "```"
+    markdown = f"""{fence}save file.txt
+This is a long file with multiple sections.
+
+Here's some initial content that works fine.
+
+**Structure:**
+{fence}
+More content that should be included but gets cut off.
+
+## Another Section
+Even more content here.
+{fence}
+
+"""  # Blank line after closing fence confirms completion in streaming mode
+
+    blocks = list(_extract_codeblocks(markdown, streaming=True))
+    # No complete blocks should be extracted because the opening save fence is never closed
+    # (the fence after "Structure:" opens a new block, and the final fence closes that block)
+    assert len(blocks) == 0, "Should not extract incomplete block in streaming mode"
+
+
+def test_append_with_markdown_header_and_bare_backticks():
+    """
+    Another common failure from autonomous runs: append with markdown headers
+    (## Subtitle) followed by bare backticks, causing early tool termination.
+
+    The content after the bare backticks is lost because parser treats it as
+    the closing fence.
+    """
+    fence = "```"
+    markdown = f"""{fence}append journal.md
+# Journal Entry
+
+Some initial content here.
+
+## Subtitle
+{fence}
+This content after the bare backticks should be included but isn't.
+
+## Another Section
+More content that gets lost.
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+    content = blocks[0].content
+    assert "Journal Entry" in content
+    assert "Subtitle" in content
+    assert "This content after the bare backticks" in content
+    assert "Another Section" in content
+    assert "More content that gets lost" in content
+
+
+def test_append_with_markdown_header_and_bare_backticks_streaming():
+    """
+    Streaming mode variant of test_append_with_markdown_header_and_bare_backticks.
+
+    In streaming mode, markdown headers (## Subtitle) followed by bare backticks
+    can cause the parser to incorrectly detect block closure, cutting off content.
+
+    This test verifies the parser correctly handles this pattern during streaming,
+    waiting for blank line confirmation before treating the closing fence as final.
+    """
+    fence = "```"
+    markdown = f"""{fence}append journal.md
+# Journal Entry
+
+Some initial content here.
+
+## Subtitle
+{fence}
+This content after the bare backticks should be included but isn't.
+
+## Another Section
+More content that gets lost.
+{fence}
+
+"""  # Blank line confirms completion in streaming mode
+
+    blocks = list(_extract_codeblocks(markdown, streaming=True))
+    # No complete blocks should be extracted because the opening markdown fence is never closed
+    # (the fence after "Subtitle" opens a new block, and the final fence closes that block)
+    assert len(blocks) == 0, "Should not extract incomplete block in streaming mode"
+
+
+def test_save_with_bold_text_and_bare_backticks():
+    """
+    Variation on the common failure: any header-like structure (bold text, markdown
+    headers) followed by bare backticks causes premature closure.
+    """
+    fence = "```"
+    markdown = f"""{fence}save notes.md
+# Main Title
+
+Some content here.
+
+**Important Note:**
+{fence}
+Additional content that gets cut off.
+
+**Another Bold Header:**
+{fence}python
+# This code block also gets lost
+def example():
+    pass
+{fence}
+
+Final content.
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+    content = blocks[0].content
+    assert "Main Title" in content
+    assert "Important Note:" in content
+    assert "Additional content" in content
+    assert "Another Bold Header:" in content
+    assert "def example():" in content
+    assert "Final content" in content
+
+
+def test_save_with_bold_text_and_bare_backticks_streaming():
+    """
+    Streaming mode variant of test_save_with_bold_text_and_bare_backticks.
+
+    Tests that bold text headers (**Important Note:**) followed by bare backticks
+    don't cause premature block closure during streaming.
+
+    This pattern is common in documentation and frequently appeared in production
+    autonomous runs, causing content truncation. The blank line after closing
+    fence confirms completion in streaming mode.
+    """
+    fence = "```"
+    markdown = f"""{fence}save notes.md
+# Main Title
+
+Some content here.
+
+**Important Note:**
+{fence}
+Additional content that gets cut off.
+
+**Another Bold Header:**
+{fence}python
+# This code block also gets lost
+def example():
+    pass
+{fence}
+
+Final content.
+{fence}
+
+"""  # Blank line confirms completion in streaming mode
+
+    blocks = list(_extract_codeblocks(markdown, streaming=True))
+    # No complete blocks should be extracted because the opening save fence is never closed
+    # Per Erik's review: 1. save (open), 2. no langtag (open), 3. python (open),
+    # 4. no langtag (closes 3), 5. no langtag (closes 2), but no 6th fence to close 1
+    assert len(blocks) == 0, "Should not extract incomplete block in streaming mode"
+
+
+def test_save_with_nested_bare_backtick_block():
+    """
+    Test from PR #1429 review: a save block containing a bare backtick block
+    (like a tree listing or ascii diagram) nested inside it.
+
+    The parser should treat the bare backtick fences as a nested block,
+    keeping the outer save block open until the final closing fence.
+
+    Fence structure:
+    1. ```save filename.txt   (opens outer block, depth=1)
+    2. ```                     (opens nested block, depth=2)
+    3. ```                     (closes nested, depth=1)
+    4. ```                     (closes outer, depth=0)
+    """
+    fence = "```"
+    markdown = f"""\
+Let's call save:
+
+{fence}save filename.txt
+# Title
+
+Blah
+
+## Structure
+
+{fence}
+[tree-like listing or ascii-diagram - typical non-langtag block]
+{fence}
+
+## Last section
+That's all
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+    content = blocks[0].content
+    assert blocks[0].lang == "save filename.txt"
+    assert "# Title" in content
+    assert "Blah" in content
+    assert "## Structure" in content
+    assert "tree-like listing" in content
+    assert "## Last section" in content
+    assert "That's all" in content
+
+
+def test_save_with_nested_bare_backtick_block_streaming():
+    """
+    Streaming mode variant of test_save_with_nested_bare_backtick_block.
+
+    Tests that the streaming parser correctly handles a save block containing
+    a bare backtick block (tree listing, ascii diagram) inside it, with
+    content continuing after the nested block closes.
+
+    With blank line after final fence, streaming should extract the block.
+    Without blank line, it should remain open (incomplete).
+    """
+    fence = "```"
+
+    # Complete version (blank line after final fence confirms completion)
+    markdown_complete = f"""\
+Let's call save:
+
+{fence}save filename.txt
+# Title
+
+Blah
+
+## Structure
+
+{fence}
+[tree-like listing or ascii-diagram - typical non-langtag block]
+{fence}
+
+## Last section
+That's all
+{fence}
+
+"""
+
+    blocks = list(_extract_codeblocks(markdown_complete, streaming=True))
+    assert len(blocks) == 1
+    content = blocks[0].content
+    assert blocks[0].lang == "save filename.txt"
+    assert "# Title" in content
+    assert "tree-like listing" in content
+    assert "## Last section" in content
+    assert "That's all" in content
+
+    # Incomplete version (no blank line - block still streaming)
+    markdown_incomplete = f"""\
+Let's call save:
+
+{fence}save filename.txt
+# Title
+
+Blah
+
+## Structure
+
+{fence}
+[tree-like listing or ascii-diagram - typical non-langtag block]
+{fence}
+
+## Last section
+That's all
+{fence}"""
+
+    blocks = list(_extract_codeblocks(markdown_incomplete, streaming=True))
+    assert len(blocks) == 0, "Should not extract block without trailing blank line"
+
+
+def test_save_with_bare_backticks_incremental_streaming():
+    """
+    Simulates real LLM streaming where content arrives line-by-line.
+
+    The parser is called repeatedly with accumulated content as new lines arrive.
+    At certain intermediate states — specifically when a bare ``` fence is the
+    last line received — the parser may prematurely extract the block because
+    ``split("\\n")`` on ``"```\\n"`` produces ``["```", ""]``, and the empty
+    trailing element is indistinguishable from a real blank line that confirms
+    block closure in streaming mode.
+
+    This test verifies that NO premature block extraction happens at any
+    intermediate step. The block should only be extractable after the true
+    closing fence AND its confirming blank line have both arrived.
+    """
+    fence = "```"
+
+    # Full content that should parse correctly when complete
+    lines = [
+        "Let's call save:\n",
+        "\n",
+        f"{fence}save filename.txt\n",
+        "# Title\n",
+        "\n",
+        "Blah\n",
+        "\n",
+        "## Structure\n",
+        "\n",
+        f"{fence}\n",  # bare fence - opens nested block
+        "tree-like listing\n",
+        f"{fence}\n",  # bare fence - closes nested block
+        "\n",
+        "## Last section\n",
+        "That's all\n",
+        f"{fence}\n",  # closes outer save block
+        "\n",  # blank line confirming closure
+    ]
+
+    # Simulate incremental streaming: feed content line-by-line
+    # (as the real llm/__init__.py streaming loop does)
+    content_so_far = ""
+    premature_extractions = []
+    for step, line in enumerate(lines):
+        content_so_far += line
+        blocks = list(_extract_codeblocks(content_so_far, streaming=True))
+        if blocks and step < len(lines) - 1:
+            # Block extracted before all content arrived — premature!
+            premature_extractions.append(
+                (step, line.rstrip(), len(blocks), blocks[0].lang)
+            )
+
+    # No premature extraction should happen at intermediate steps
+    assert not premature_extractions, (
+        f"Premature block extraction at steps: {premature_extractions}. "
+        f"The parser should not extract blocks until all content has arrived."
+    )
+
+    # Final state should have exactly 1 complete block
+    final_blocks = list(_extract_codeblocks(content_so_far, streaming=True))
+    assert len(final_blocks) == 1
+    assert final_blocks[0].lang == "save filename.txt"
+    assert "tree-like listing" in final_blocks[0].content
+    assert "Last section" in final_blocks[0].content
+
+
+# Tests for quad+ backtick support (Issue #1005)
+def test_quad_backticks_contain_triple():
+    """Quad backticks should allow triple backticks inside without closing."""
+    markdown = (
+        "````save /path/to/file.md\n"
+        "# Example Doc\n"
+        "\n"
+        "```python\n"
+        "print('hello')\n"
+        "```\n"
+        "````"
+    )
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert len(blocks) == 1
+    assert blocks[0].lang == "save /path/to/file.md"
+    assert "```python" in blocks[0].content
+    assert "print('hello')" in blocks[0].content
+
+
+def test_quintuple_backticks_contain_quad():
+    """Quintuple backticks should allow quad backticks inside."""
+    markdown = (
+        "`````markdown\n"
+        "Example using quad backticks:\n"
+        "\n"
+        "````python\n"
+        "code here\n"
+        "````\n"
+        "`````"
+    )
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert len(blocks) == 1
+    assert blocks[0].lang == "markdown"
+    assert "````python" in blocks[0].content
+
+
+def test_quad_backticks_not_closed_by_triple():
+    """Quad backticks should not be closed by triple backticks."""
+    markdown = "````text\nline 1\n```\nline 2\n````"
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert len(blocks) == 1
+    assert blocks[0].lang == "text"
+    assert "line 1" in blocks[0].content
+    assert "```" in blocks[0].content
+    assert "line 2" in blocks[0].content
+
+
+def test_mismatched_fence_lengths():
+    """Mismatched fence lengths should not be parsed as complete blocks.
+
+    Per CommonMark spec, opening and closing fences must have the same length.
+    E.g., ````text\nline 1\n``` should not parse as a valid block because
+    the opening fence (4 backticks) doesn't match the closing fence (3 backticks).
+    """
+    # Quad opening, triple closing - should NOT be extracted as complete block
+    markdown = "````text\nline 1\n```"
+    blocks = Codeblock.iter_from_markdown(markdown)
+    # No complete block should be extracted since closing fence doesn't match
+    assert len(blocks) == 0
+
+    # Quintuple opening, quad closing - should NOT be extracted
+    markdown2 = "`````text\nline 1\n````"
+    blocks2 = Codeblock.iter_from_markdown(markdown2)
+    assert len(blocks2) == 0
+
+    # Triple opening, quad closing - should NOT be extracted
+    markdown3 = "```text\nline 1\n````"
+    blocks3 = Codeblock.iter_from_markdown(markdown3)
+    assert len(blocks3) == 0
+
+
+def test_thinking_block_with_closing_thinking_tag():
+    """
+    Gemini uses </thinking> (not </think>) to close thinking blocks.
+    _extract_codeblocks should handle both tags so that save/execute blocks
+    after the thinking block are not swallowed by an unclosed nesting level.
+
+    Regression test for: autoresearch practical5 plateau where gemini-2.0-flash-001
+    wraps reasoning in ```thinking>...</thinking> and the save block after it was
+    never executed because </thinking> was not stripped.
+    """
+    markdown = "```thinking>\nsome model reasoning here\n</thinking>\n```save pipeline.py\nprint('hello')\n```"
+    blocks = list(_extract_codeblocks(markdown))
+    # The save block after </thinking> should be extracted
+    assert len(blocks) == 1
+    assert blocks[0].lang.startswith("save")
+    assert "print('hello')" in blocks[0].content
+
+
+def test_thinking_tag_concatenated_to_closing_fence():
+    """A closing fence concatenated with <think> should not swallow later tool blocks."""
+    markdown = "```shell\npwd\n```<think>\nbrief reasoning\n</think>\n```save pipeline.py\nprint('hello')\n```"
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 2
+    assert blocks[0].lang == "shell"
+    assert blocks[0].content == "pwd"
+    assert blocks[1].lang.startswith("save")
+    assert "print('hello')" in blocks[1].content
+
+
+def test_adjacent_outer_fences_split_tool_blocks():
+    """Inner-loop recovery: 6-backtick line inside an open block yields both blocks.
+
+    This exercises the pre-existing inner-loop guard (nesting_depth==1 path),
+    NOT the new outer-loop guard added in this commit. The ``````lang line appears
+    before block 1's closing fence, so the inner loop rewrites it and reprocesses.
+    """
+    # Inner-loop case: 6-backtick line appears inside block 1 (no closing fence before it)
+    markdown = (
+        "```patch /tmp/file1.py\n"
+        "<<<<<<< ORIGINAL\nold\n=======\nnew\n>>>>>>> UPDATED\n"
+        "``````patch /tmp/file2.py\n"
+        "<<<<<<< ORIGINAL\nold2\n=======\nnew2\n>>>>>>> UPDATED\n"
+        "```"
+    )
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 2
+    assert blocks[0].lang == "patch /tmp/file1.py"
+    assert blocks[1].lang == "patch /tmp/file2.py"
+    assert "old2" in blocks[1].content
+
+
+def test_adjacent_outer_fences_outer_level():
+    """Outer-loop case: 6-backtick line at outer level (after a properly-closed block)."""
+    # Block 1 is properly closed with ```, then "``````patch" appears at the outer loop level.
+    # Without the fix, fence_len=6 would cause the inner loop to search for a 6-backtick
+    # closing fence, never find one, and silently drop block 2.
+    markdown = (
+        "```patch /tmp/file1.py\n"
+        "<<<<<<< ORIGINAL\nold\n=======\nnew\n>>>>>>> UPDATED\n"
+        "```\n"
+        "``````patch /tmp/file2.py\n"
+        "<<<<<<< ORIGINAL\nold2\n=======\nnew2\n>>>>>>> UPDATED\n"
+        "```"
+    )
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 2
+    assert blocks[0].lang == "patch /tmp/file1.py"
+    assert "old" in blocks[0].content
+    assert blocks[1].lang == "patch /tmp/file2.py"
+    assert "old2" in blocks[1].content
+
+
+def test_thinking_tag_concatenated_then_standalone_closed():
+    """Concatenated <think> followed by a standalone closed <think> block should yield all tool blocks."""
+    # Edge case: first block closes with ```<think> (concatenated, handled by inner-loop),
+    # followed by a properly-closed standalone <think>...</think>, then another tool block.
+    # The for-else early-exit must NOT fire here — standalone <think> is closed.
+    markdown = "```shell\npwd\n```<think>\nbrief reasoning\n</think>\n<think>\nmore thinking\n</think>\n```save pipeline.py\nprint('hello')\n```"
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 2
+    assert blocks[0].lang == "shell"
+    assert blocks[0].content == "pwd"
+    assert blocks[1].lang.startswith("save")
+    assert "print('hello')" in blocks[1].content
+
+
+def test_thinking_block_with_closing_think_tag():
+    """Existing </think> tag variant still works after refactor."""
+    markdown = "<think>\nsome thinking\n</think>\n```save result.py\nx = 1\n```"
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+    assert blocks[0].lang.startswith("save")
+    assert "x = 1" in blocks[0].content
+
+
+def test_thinking_block_unclosed_thinking_tag_early_exit():
+    """Unclosed <thinking> tag (no </thinking>) should cause early exit — no blocks extracted."""
+    markdown = "<thinking>\nmodel is still reasoning...\n```save pipeline.py\nprint('hello')\n```"
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 0
+
+
+def test_thinking_tag_concatenated_then_unclosed_standalone():
+    """Concatenated <think> followed by a genuinely unclosed standalone <think> should early-exit."""
+    # After the concatenated closing (```<think>...</think>), a new standalone <think>
+    # block is opened but never closed — no tool blocks should be extracted.
+    markdown = "```shell\npwd\n```<think>\nbrief reasoning\n</think>\n<think>\nstill thinking...\n```save pipeline.py\nprint('hello')\n```"
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 0
+
+
+def test_adjacent_fences_bare_multifence_content_line():
+    """A content line of bare 6 backticks inside a block must NOT trigger adjacent-fence recovery."""
+    # "``````" (6 backticks) is a valid content line, not a pair of adjacent fences.
+    # With fence_len=3, the adjacent-fence guard must require a non-backtick char after
+    # the fence prefix; otherwise it incorrectly splits the block.
+    markdown = "```shell\nsome code\n``````\nmore code\n```"
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+    assert blocks[0].lang == "shell"
+    assert "``````" in blocks[0].content
+    assert "more code" in blocks[0].content
+
+
+def test_fence_preserved_in_extraction():
+    """Codeblock.fence should reflect the original fence length (3+)."""
+    # Triple backticks (default)
+    blocks = list(_extract_codeblocks("```python\ncode\n```"))
+    assert len(blocks) == 1
+    assert blocks[0].fence == "```"
+
+    # Quadruple backticks (used by md_codeblock() to wrap content with triple fences)
+    blocks = list(_extract_codeblocks("````python\ncode\n````"))
+    assert len(blocks) == 1
+    assert blocks[0].fence == "````"
+
+    # Quintuple backticks
+    blocks = list(_extract_codeblocks("`````txt\ncode\n`````"))
+    assert len(blocks) == 1
+    assert blocks[0].fence == "`````"
+
+    # to_markdown() should use the original fence
+    assert blocks[0].to_markdown().startswith("`````txt")
+
+
+# --- XML round-trip and edge-case tests ---
+
+
+def test_from_xml_basic():
+    """from_xml should parse a well-formed codeblock element."""
+    xml = '<codeblock lang="python">print("hello")</codeblock>'
+    cb = Codeblock.from_xml(xml)
+    assert cb.lang == "python"
+    assert cb.content == 'print("hello")'
+    assert cb.path is None
+
+
+def test_from_xml_with_path():
+    """from_xml should parse optional path attribute."""
+    xml = '<codeblock lang="python" path="main.py">code</codeblock>'
+    cb = Codeblock.from_xml(xml)
+    assert cb.lang == "python"
+    assert cb.content == "code"
+    assert cb.path == "main.py"
+
+
+def test_from_xml_missing_lang():
+    """from_xml should not crash when lang attribute is missing."""
+    xml = "<codeblock>some content</codeblock>"
+    cb = Codeblock.from_xml(xml)
+    assert cb.lang == ""
+    assert cb.content == "some content"
+
+
+def test_from_xml_empty_content():
+    """from_xml should handle empty content gracefully."""
+    xml = '<codeblock lang="txt"></codeblock>'
+    cb = Codeblock.from_xml(xml)
+    assert cb.lang == "txt"
+    assert cb.content == ""
+
+
+def test_xml_roundtrip():
+    """to_xml -> from_xml should preserve content."""
+    original = Codeblock("python", "x = 1 + 2\nprint(x)", "test.py")
+    xml = original.to_xml()
+    restored = Codeblock.from_xml(xml)
+    assert restored.lang == original.lang
+    assert restored.content == original.content
+    assert restored.path == original.path
+
+
+def test_xml_roundtrip_special_chars():
+    """XML round-trip should handle special characters."""
+    original = Codeblock("python", 'if x < 10 & y > 5:\n    print("ok")')
+    xml = original.to_xml()
+    restored = Codeblock.from_xml(xml)
+    assert restored.content == original.content
+
+
+def test_from_markdown_normalizes_crlf():
+    """CRLF input must produce the same content as LF input (no carriage returns)."""
+    crlf = Codeblock.from_markdown("```python\r\nprint(1)\r\n```")
+    lf = Codeblock.from_markdown("```python\nprint(1)\n```")
+    assert crlf.content == lf.content
+    assert "\r" not in crlf.content
+
+
+def test_iter_from_markdown_normalizes_crlf():
+    """CRLF input to iter_from_markdown must not leave \\r in content."""
+    blocks = Codeblock.iter_from_markdown("```python\r\nprint(1)\r\n```")
+    assert blocks == [Codeblock("python", "print(1)")]
+
+
+def test_from_markdown_normalizes_standalone_cr():
+    """Standalone \\r (old-Mac) line endings must also be normalized."""
+    cr = Codeblock.from_markdown("```python\rprint(1)\r```")
+    lf = Codeblock.from_markdown("```python\nprint(1)\n```")
+    assert cr.content == lf.content
+    assert "\r" not in cr.content
+
+
+def test_iter_from_markdown_normalizes_standalone_cr():
+    """Standalone \\r (old-Mac) line endings must also be normalized."""
+    blocks = Codeblock.iter_from_markdown("```python\rprint(1)\r```")
+    assert blocks == [Codeblock("python", "print(1)")]
+
+
+def test_from_markdown_leading_whitespace_after_fence():
+    """Leading whitespace between the opening fence and the lang must not leak
+    lang characters into the content.
+
+    Regression test: the body was sliced on ``len(lang)`` (the *stripped* lang),
+    which ignored any whitespace between the fence and the lang. For an opening
+    like ```` ``` python ```` the slice was one short, so the tail of the lang
+    word leaked into the content — e.g. content became ``"n\\nprint(1)"``.
+    """
+    # single space between fence and lang
+    cb = Codeblock.from_markdown("``` python\nprint(1)\n```")
+    assert cb.lang == "python"
+    assert cb.content == "print(1)\n"
+
+    # multiple spaces between fence and lang
+    cb = Codeblock.from_markdown("```  python\nprint(1)\n```")
+    assert cb.lang == "python"
+    assert cb.content == "print(1)\n"
+
+    # trailing space on the lang line is consumed, not leaked into content
+    cb = Codeblock.from_markdown("``` python \nprint(1)\n```")
+    assert cb.lang == "python"
+    assert cb.content == "print(1)\n"
+
+    # path-like lang with leading whitespace (common in save blocks)
+    cb = Codeblock.from_markdown("``` save path/to/file.py\nprint(1)\n```")
+    assert cb.lang == "save path/to/file.py"
+    assert cb.content == "print(1)\n"
+
+
+def test_extract_codeblocks_shell_quoted_non_heredoc_lt():
+    """A ``<<`` inside a quoted string is not a heredoc operator.
+
+    Regression for the Greptile P1 on gptme/gptme#3703: ``echo "a << b"``
+    recorded ``b`` as a heredoc terminator, re-enabling the depth-1
+    look-ahead so the real closer was treated as a nested opener and
+    subsequent prose/output blocks were absorbed into the command.
+    """
+    markdown = """```shell
+echo "a << b"
+```
+prose after
+
+```
+output here
+```
+"""
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert blocks == [
+        Codeblock("shell", 'echo "a << b"'),
+        Codeblock("", "output here"),
+    ]
+
+
+def test_extract_codeblocks_shell_multiline_quoted_string_no_phantom_heredoc():
+    """A ``<<`` inside a multi-line single-quoted string must not be treated
+    as a heredoc opener.
+
+    Regression for the quote-state-across-lines bug: ``_find_heredoc_terminator``
+    used to start each line with ``in_single=False``, so the ``<< EOF`` on the
+    continuation line of ``s='\\n<< EOF\\n'`` was misidentified as a heredoc
+    opener.  That phantom terminator matched the standalone ``EOF`` in subsequent
+    prose, causing the parser to absorb the real closing fence, the prose, and
+    the output block into an oversized shell block.
+    """
+    markdown = "```shell\ns='\n<< EOF\n'\necho \"$s\"\n```\nThis is documentation.\n\nEOF\n```\noutput\n```\n"
+    blocks = Codeblock.iter_from_markdown(markdown)
+    assert blocks == [
+        Codeblock("shell", "s='\n<< EOF\n'\necho \"$s\""),
+        Codeblock("", "output"),
+    ], (
+        "The << EOF inside the single-quoted string must not open heredoc state; "
+        "the shell block must close at its own ``` fence"
+    )
+
+
+def test_extract_codeblocks_shell_streaming_exec_lang_closes_without_blank_line():
+    """Exec-lang blocks in streaming mode must close at the bare fence
+    regardless of whether a blank confirmation line follows.
+
+    Regression for the trailing-blank-line sensitivity: previously, streaming
+    mode required a blank line after ``` to confirm closure.  For exec langs
+    (shell, bash, python, …) this was wrong — these langs have no triple-backtick
+    syntax of their own, so a bare fence at depth 1 is always a closer.
+
+    The practical consequence was asymmetric stop-detection: a complete reply
+    ending in ``...```\\n`` yielded no blocks, while the same reply with an extra
+    trailing newline yielded one oversized block absorbing prose and output.
+    Both variants must now yield just the shell block (the output block may not
+    be extractable in streaming mode when no confirmation newline follows it).
+    """
+    from gptme.codeblock import _extract_codeblocks
+
+    # A complete LLM reply: shell command + prose + output block.
+    message = "```shell\necho hello\n```\nThe exact output is:\n\n```\nhello\n```\n"
+
+    # Non-streaming: both blocks extracted.
+    blocks_default = list(_extract_codeblocks(message, streaming=False))
+    assert blocks_default == [
+        Codeblock("shell", "echo hello"),
+        Codeblock("", "hello"),
+    ], "Non-streaming should extract both blocks"
+
+    # Streaming + single trailing newline: shell block extracted.
+    # (The output block has no blank confirmation line in this variant.)
+    blocks_stream_single = list(_extract_codeblocks(message, streaming=True))
+    assert blocks_stream_single == [Codeblock("shell", "echo hello")], (
+        "Streaming + single trailing newline must yield the shell block "
+        "(exec langs close without blank-line confirmation)"
+    )
+
+    # Streaming + extra trailing newline: both blocks extracted.
+    # The extra newline provides the blank confirmation needed for the
+    # non-exec output block.
+    blocks_stream_double = list(_extract_codeblocks(message + "\n", streaming=True))
+    assert blocks_stream_double == [
+        Codeblock("shell", "echo hello"),
+        Codeblock("", "hello"),
+    ], (
+        "Streaming + extra trailing newline must yield both blocks; "
+        "must NOT yield an oversized block absorbing prose and output"
+    )
+
+    # Verify stop-detection semantics: the streaming parser must signal
+    # 'at least one complete block found' for a finished exec-lang reply,
+    # regardless of the trailing newline count.
+    assert len(blocks_stream_single) > 0, (
+        "Stop-detection: streaming must find at least one complete block "
+        "in a finished exec-lang reply"
+    )
+
+
+def test_extract_codeblocks_shell_quoted_bare_fence_is_literal():
+    """A bare fence inside an open multiline quoted string is literal content.
+
+    Regression for gptme/gptme#3730 Greptile P1: the exec-lang streaming
+    fast-path treated every bare fence as a closer even when the quote
+    scanner reported an open multiline string.  Closing at the data fence
+    truncated the runnable block (and stopped generation).  Guarding the
+    fast-path against quote state is necessary but not sufficient — the
+    streaming fallback then treated the same fence as a nested opener,
+    so the real closer only un-nested to depth 1 and the block was never
+    yielded.  Quoted fences must be literal content in both modes.
+    """
+    from gptme.codeblock import _extract_codeblocks
+
+    message = "```shell\ns='\n```\n'\necho done\n```\n"
+    expected = [Codeblock("shell", "s='\n```\n'\necho done")]
+
+    blocks_default = list(_extract_codeblocks(message, streaming=False))
+    assert blocks_default == expected, (
+        "Non-streaming must not close at a fence inside an open quoted string"
+    )
+
+    blocks_stream = list(_extract_codeblocks(message, streaming=True))
+    assert blocks_stream == expected, (
+        "Streaming must not close or nest at a fence inside an open quoted string"
+    )
+
+
+def test_extract_codeblocks_shell_ansi_c_escaped_quote_does_not_hide_closer():
+    """ANSI-C ``$'...'`` with an escaped quote must not leave quote state open.
+
+    Regression for gptme/gptme#3730 Greptile P1: ``x=$'a\\'b'`` was scanned as
+    POSIX single quotes (backslash ignored), so the trailing ``'`` opened a
+    new quote and the real closing fence was treated as literal content.
+    The block was never yielded.
+    """
+    from gptme.codeblock import _extract_codeblocks
+
+    message = "```shell\nx=$'a\\'b'\necho done\n```\n"
+    expected = [Codeblock("shell", "x=$'a\\'b'\necho done")]
+
+    blocks_default = list(_extract_codeblocks(message, streaming=False))
+    assert blocks_default == expected, (
+        "Non-streaming must still close after a complete ANSI-C string"
+    )
+
+    blocks_stream = list(_extract_codeblocks(message, streaming=True))
+    assert blocks_stream == expected, (
+        "Streaming must still close after a complete ANSI-C string"
+    )
