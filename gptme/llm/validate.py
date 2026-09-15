@@ -27,6 +27,7 @@ class ApiKeyValidationStatus(str, Enum):
 
 # Provider documentation URLs
 PROVIDER_DOCS: dict[str, str] = {
+    "uru": "https://gen.ai.kku.ac.th/uruacth",
     "openai": "https://platform.openai.com/account/api-keys",
     "anthropic": "https://console.anthropic.com/settings/keys",
     "openrouter": "https://openrouter.ai/settings/keys",
@@ -106,7 +107,11 @@ def validate_api_key_status(
     blip never locks the user out of saving a key they know is good.
     """
     try:
-        if provider == "openai":
+        if provider == "uru":
+            is_valid, message = _validate_openai_compatible(
+                api_key, timeout, "https://gen.ai.kku.ac.th/uruacth/api/v1"
+            )
+        elif provider == "openai":
             is_valid, message = _validate_openai(api_key, timeout)
         elif provider == "anthropic":
             is_valid, message = _validate_anthropic(api_key, timeout)

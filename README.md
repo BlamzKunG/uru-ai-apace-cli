@@ -1,75 +1,58 @@
-<p align="center">
-  <img src="https://gptme.org/media/logo.png" width=150 />
-</p>
-
-<h1 align="center">gptme</h1>
+<h1 align="center">🎓 URU AI CLI</h1>
 
 <p align="center">
-<i>/ʤiː piː tiː miː/</i>
+<b>Uttaradit Rajabhat University (URU AI Space) CLI Agent</b>
 <br>
-<sub><a href="https://gptme.org/docs/misc/acronyms.html">what does it stand for?</a></sub>
+<sub>Powerful AI Coding Agent & Terminal Assistant powered by URU AI Space</sub>
 </p>
 
 <!-- Links -->
 <p align="center">
-  <a href="https://gptme.org/docs/getting-started.html">Getting Started</a>
+  <a href="https://gen.ai.kku.ac.th/uruacth">URU AI Space Portal</a>
   •
-  <a href="https://gptme.org/downloads/">Downloads</a>
-  •
-  <a href="https://gptme.org/">Website</a>
-  •
-  <a href="https://gptme.org/docs/">Documentation</a>
-</p>
-
-<!-- Badges -->
-<p align="center">
-  <a href="https://github.com/gptme/gptme/actions/workflows/build.yml">
-    <img src="https://github.com/gptme/gptme/actions/workflows/build.yml/badge.svg" alt="Build Status" />
-  </a>
-  <a href="https://github.com/gptme/gptme/actions/workflows/docs.yml">
-    <img src="https://github.com/gptme/gptme/actions/workflows/docs.yml/badge.svg" alt="Docs Build Status" />
-  </a>
-  <a href="https://codecov.io/gh/gptme/gptme">
-    <img src="https://codecov.io/gh/gptme/gptme/graph/badge.svg?token=DYAYJ8EF41" alt="Codecov" />
-  </a>
-  <br>
-  <a href="https://pypi.org/project/gptme/">
-    <img src="https://img.shields.io/pypi/v/gptme" alt="PyPI version" />
-  </a>
-  <a href="https://pepy.tech/project/gptme">
-    <img src="https://img.shields.io/pepy/dt/gptme" alt="PyPI - Downloads all-time" />
-  </a>
-  <a href="https://pypistats.org/packages/gptme">
-    <img src="https://img.shields.io/pypi/dd/gptme?color=success" alt="PyPI - Downloads per day" />
-  </a>
-  <br>
-  <a href="https://discord.gg/NMaCmmkxWv">
-    <img src="https://img.shields.io/discord/1271539422017618012?logo=discord&style=social" alt="Discord" />
-  </a>
-  <a href="https://x.com/gptmeorg">
-    <img src="https://img.shields.io/twitter/follow/gptmeorg?style=social" alt="X.com" />
-  </a>
-  <br>
-  <a href="https://gptme.org/docs/projects.html">
-    <img src="https://gptme.org/badge.svg" alt="Built with gptme" />
-  </a>
+  <a href="https://github.com/BlamzKunG/uru-ai-apace-cli">GitHub Repository</a>
 </p>
 
 <p align="center">
-📜 A personal AI agent that runs <i>anywhere a terminal runs</i> — your laptop,
-ssh sessions, tmux, headless servers, CI pipelines.<br/>
-Provider-agnostic, local-first, and unconstrained: ships with shell, Python, web,
-vision, and everything else an agent needs.<br/>
-A great coding agent, but general-purpose enough to assist in all kinds of knowledge-work.
+📜 <b>URU AI CLI</b> is an autonomous AI developer assistant designed for the terminal.<br/>
+Powered by <b>URU AI Space</b> with support for cutting-edge models (Claude Sonnet, Gemini Flash, DeepSeek, GPT-5, Qwen, Grok, Llama).<br/>
+Features native tool calling to write files, run shell commands, analyze code, and build projects directly in your terminal.
 </p>
 
-<p align="center">
-Free and open-source. Works with Anthropic, OpenAI, Google, xAI, DeepSeek, OpenRouter,
-or fully local via <code>llama.cpp</code> — your data, your models, your terminal.<br/>
-A capable <a href="https://gptme.org/docs/alternatives.html">alternative</a> to Claude Code,
-Codex, Cursor, and Warp — one of the first agent CLIs (Spring 2023), still in very
-active development.
-</p>
+---
+
+## 🚀 Quick Start
+
+### 1. Installation
+```bash
+# Clone the repository
+git clone https://github.com/BlamzKunG/uru-ai-apace-cli.git
+cd uru-ai-apace-cli
+
+# Install in editable mode
+pip install -e .
+```
+
+### 2. Interactive Setup
+Run the setup wizard to connect your URU AI Space API Key and select your default model dynamically:
+```bash
+uru-setup
+```
+
+### 3. Usage
+```bash
+# Start an interactive chat
+uru
+
+# Ask a one-off question or give a task
+uru "Create a Python script that scrapes the weather in Bangkok"
+
+# Use a specific model from URU AI Space
+uru -m uru/claude-sonnet-5 "Analyze this codebase and find bugs"
+uru -m uru/gemini-3.8-flash "Help me write a FastAPI server"
+```
+
+---
 
 ## 📚 Table of Contents
 

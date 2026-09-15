@@ -22,31 +22,129 @@ from ..util import console, path_with_tilde
 
 
 def setup():
-    """Setup gptme with completions, configuration, and project setup."""
+    """Setup URU AI CLI (Uttaradit Rajabhat University)."""
+    console.print(
+        Panel.fit(
+            "[bold green]🎓 URU AI CLI Setup[/bold green]\n"
+            "[bold white]Uttaradit Rajabhat University (URU AI Space)[/bold white]",
+            style="green",
+            padding=(1, 3),
+        )
+    )
 
-    # 1. Show user configuration status
-    _show_user_config_status()
+    config = get_config()
+    current_key = config.get_env("URU_API_KEY")
 
-    # 2. Project setup
-    _setup_project()
+    # 1. Setup URU API Key
+    if current_key:
+        masked = current_key[:7] + "..." + current_key[-4:] if len(current_key) > 12 else "***"
+        console.print(f"[green]✅ Current URU AI Space API Key:[/green] [dim]{masked}[/dim]")
+        if Confirm.ask("Do you want to change your API key?", default=False):
+            api_key = _prompt_uru_api_key()
+        else:
+            api_key = current_key
+    else:
+        api_key = _prompt_uru_api_key()
 
-    # 3. Optional dependencies
-    _check_optional_dependencies()
+    # 2. Dynamic Model Selection from URU AI Space
+    _setup_uru_model(api_key)
 
-    # 4. Pre-commit setup
-    _suggest_precommit()
-
-    # 5. Shell completions
-    _setup_completions()
+    # 3. Shell completions
+    if Confirm.ask("\nWould you like to install shell completions?", default=False):
+        _setup_completions()
 
     console.print(
         Panel.fit(
-            "[bold green]✅ Setup complete![/bold green]\n"
-            "You can now use gptme with improved configuration.",
+            "[bold green]✅ URU AI CLI Setup Complete![/bold green]\n\n"
+            "Start chatting with URU AI:\n"
+            "  [bold cyan]uru[/bold cyan]                          (Interactive Chat)\n"
+            "  [bold cyan]uru \"Your question here\"[/bold cyan]   (Quick command)\n"
+            "  [bold cyan]uru -m uru/claude-sonnet-5[/bold cyan]   (Use specific model)",
             style="green",
-            padding=(0, 1),
+            padding=(1, 2),
         )
     )
+
+
+def _prompt_uru_api_key() -> str:
+    """Prompt user for URU AI Space API Key and validate."""
+    from ..llm.validate import validate_api_key
+
+    console.print("\n[bold]Enter your URU AI Space API Key[/bold] [dim](starts with sk_...)[/dim]:")
+    console.print("[dim]Get your key from: https://gen.ai.kku.ac.th/uruacth[/dim]")
+
+    while True:
+        api_key = Prompt.ask("URU API Key", password=True).strip()
+        if not api_key:
+            continue
+
+        console.print("[dim]Validating API key with URU AI Space...[/dim]")
+        is_valid, err_msg = validate_api_key(api_key, "uru")
+        if is_valid:
+            set_config_value("env.URU_API_KEY", api_key)
+            console.print("[green]✅ URU API Key validated and saved successfully![/green]")
+            return api_key
+        else:
+            console.print(f"[red]❌ Validation failed: {err_msg}[/red]")
+            if not Confirm.ask("Try again?", default=True):
+                raise KeyboardInterrupt
+
+
+def _setup_uru_model(api_key: str):
+    """Fetch live models from URU AI Space and let user select their default model."""
+    from ..llm.models.listing import _get_models_for_provider
+    from ..llm.models import get_model
+
+    console.print("\n[bold cyan]🔄 Fetching available models dynamically from URU AI Space...[/bold cyan]")
+    try:
+        models = _get_models_for_provider("uru", dynamic_fetch=True)
+    except Exception as e:
+        console.print(f"[yellow]⚠️ Could not fetch live models: {e}. Using cached list.[/yellow]")
+        from ..llm.models.data import MODELS
+        models = [get_model(f"uru/{m}") for m in MODELS.get("uru", {})]
+
+    if not models:
+        console.print("[yellow]No models found. Defaulting to gemini-3.8-flash.[/yellow]")
+        set_config_value("chat.model", "uru/gemini-3.8-flash")
+        return
+
+    # Display models table
+    table = Table(title="Available URU AI Space Models", show_header=True, box=None)
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Model Name", style="bold cyan")
+    table.add_column("Context Window", style="green")
+
+    model_names = []
+    default_idx = 1
+    for idx, m in enumerate(models, 1):
+        model_names.append(m.model)
+        ctx_str = f"{m.context:,} tokens" if m.context else "Standard"
+        rec_tag = " [bold green](Default)[/bold green]" if m.model in ("gemini-3.8-flash", "claude-sonnet-5") else ""
+        if m.model == "gemini-3.8-flash":
+            default_idx = idx
+        table.add_row(str(idx), f"{m.model}{rec_tag}", ctx_str)
+
+    console.print(table)
+
+    choice = Prompt.ask(
+        "\nSelect default model number or name",
+        default=str(default_idx),
+    ).strip()
+
+    if choice.isdigit() and 1 <= int(choice) <= len(model_names):
+        selected_model = model_names[int(choice) - 1]
+    elif choice in model_names:
+        selected_model = choice
+    else:
+        selected_model = model_names[default_idx - 1]
+
+    set_config_value("chat.model", f"uru/{selected_model}")
+    console.print(f"[green]✅ Default model set to:[/green] [bold cyan]uru/{selected_model}[/bold cyan]")
+
+
+def main():
+    """CLI entrypoint for uru-setup."""
+    setup()
 
 
 def _detect_shell() -> str | None:

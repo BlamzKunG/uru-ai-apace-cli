@@ -2300,6 +2300,16 @@ def get_available_models(provider: Provider) -> list[ModelMeta]:
             api_key=get_api_key(config),
         )
 
+    if provider == "uru":
+        base_url = config.get_env("URU_BASE_URL", "https://gen.ai.kku.ac.th/uruacth/api/v1")
+        api_key = config.get_env("URU_API_KEY") or config.get_env("OPENAI_API_KEY")
+        return _get_openai_compatible_models(
+            config,
+            provider_name="uru",
+            base_url=base_url,
+            api_key=api_key,
+        )
+
     if provider != "openrouter":
         raise ValueError(f"Provider {provider} does not support listing models")
 

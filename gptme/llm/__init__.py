@@ -106,6 +106,7 @@ PROVIDER_DEFAULT_MODELS: dict[str, str] = {
 # Mapping from provider name to the environment variable that holds its API key.
 # This is the single source of truth for provider authentication env vars.
 PROVIDER_API_KEYS: dict[str, str] = {
+    "uru": "URU_API_KEY",
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
@@ -1241,7 +1242,8 @@ def get_model_from_api_key(api_key: str) -> tuple[str, Provider, str] | None:
     """
     Guess the model from the API key prefix.
     """
-
+    if api_key.startswith("sk_"):
+        return api_key, "uru", "URU_API_KEY"
     if api_key.startswith("sk-ant-"):
         return api_key, "anthropic", "ANTHROPIC_API_KEY"
     if api_key.startswith("sk-or-"):
@@ -1268,7 +1270,7 @@ def get_available_models(provider: Provider) -> list[ModelMeta]:
         ValueError: If provider doesn't support listing models
         Exception: If API request fails
     """
-    if provider in ("openrouter", "local", "gptme") or is_custom_provider(provider):
+    if provider in ("uru", "openrouter", "local", "gptme") or is_custom_provider(provider):
         from .llm_openai import get_available_models as get_openai_models
 
         return get_openai_models(provider)

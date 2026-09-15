@@ -272,7 +272,7 @@ def _resolve_model(model: str) -> ModelMeta:
                 )
 
             # For providers that support dynamic fetching, use _get_models_for_provider
-            if provider in ("openrouter", "gptme"):
+            if provider in ("uru", "openrouter", "gptme"):
                 try:
                     from .listing import _get_models_for_provider  # fmt: skip
 

@@ -114,10 +114,10 @@ def prompt_gptme(
     from ..__version__ import __version__
 
     if agent_name:
-        agent_blurb = f"{agent_name}, an agent running in gptme v{__version__}, letting you act as a general-purpose AI assistant powered by LLMs"
+        agent_blurb = f"{agent_name}, an AI coding assistant and agent developed for Uttaradit Rajabhat University (URU AI Space)"
     else:
-        agent_name = f"gptme v{__version__}"
-        agent_blurb = f"{agent_name}, a general-purpose AI assistant powered by LLMs"
+        agent_name = "URU AI"
+        agent_blurb = f"{agent_name}, an intelligent coding assistant and agent developed for Uttaradit Rajabhat University (URU AI Space)"
 
     placeholder_guidance = (
         "Do not use unset placeholders like `$REPO`."
