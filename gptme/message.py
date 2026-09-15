@@ -86,6 +86,14 @@ class UsageData(TypedDict, total=False):
     reasoning_tokens: int
 
 
+class QuotaData(TypedDict, total=False):
+    """API quota data (e.g. URU AI Space daily tokens quota)."""
+
+    daily_quota_tokens: int
+    daily_usage_tokens: int
+    daily_remaining_tokens: int
+
+
 class ArtifactDescriptor(TypedDict, total=False):
     """A tool/plugin-emitted artifact descriptor (see ErikBjare/bob#830).
 
@@ -174,6 +182,7 @@ class MessageMetadata(TypedDict, total=False):
     resolved_model: str
     cost: float  # Cost in USD
     usage: UsageData
+    quota: QuotaData
     # Effective reasoning effort level applied to the request (e.g. "high"),
     # set only when ``GPTME_THINKING_EFFORT`` (or a model ``:level`` suffix)
     # actually shaped the request. Absent means the provider default applied.

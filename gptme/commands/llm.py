@@ -427,12 +427,11 @@ def cmd_context(ctx: CommandContext) -> None:
         console.log(f"[dim](approximate, using {tokenizer_model} tokenizer)[/dim]")
 
 
-@command("tokens", aliases=["cost"])
-def cmd_tokens(ctx: CommandContext) -> None:
-    """Show token usage and costs.
+@command("usage", aliases=["quota", "tokens", "cost"])
+def cmd_usage(ctx: CommandContext) -> None:
+    """Show token usage, daily quota, and costs.
 
-    Shows session costs (current session) and conversation costs (all messages)
-    when both are available. Falls back to approximation for old conversations.
+    Shows daily quota utilization, session tokens, and per-step breakdown.
     """
     from ..util.cost_display import (
         display_costs,
@@ -445,6 +444,10 @@ def cmd_tokens(ctx: CommandContext) -> None:
     conversation = gather_conversation_costs(ctx.manager.log.messages)
     per_step = gather_per_step_costs(ctx.manager.log.messages)
     display_costs(session, conversation, per_step=per_step)
+
+
+# Keep cmd_tokens as backward compatibility reference if needed
+cmd_tokens = cmd_usage
 
 
 def _print_available_models() -> None:

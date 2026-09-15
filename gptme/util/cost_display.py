@@ -78,6 +78,7 @@ class CostData:
     total: TotalCosts
     source: str  # "session" | "conversation" | "approximation"
     biggest_turn: BiggestTurn | None = None
+    quota: dict | None = None
 
 
 def _short_model_name(full_model: str) -> str:
@@ -109,10 +110,34 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
+def _render_quota_bar(pct: float, width: int = 24) -> str:
+    """Render a colored ASCII progress bar for quota usage."""
+    filled = int(round((pct / 100) * width))
+    filled = max(0, min(width, filled))
+    empty = width - filled
+    bar = "█" * filled + "░" * empty
+    if pct >= 90:
+        color = "red"
+    elif pct >= 70:
+        color = "yellow"
+    else:
+        color = "green"
+    return f"[{color}][{bar}] {pct:.2f}%[/{color}]"
+
+
 def inline_cost_text(msg: Message) -> str | None:
     """Build the inline cost summary for an assistant message."""
-    if os.environ.get("GPTME_SHOW_COST") != "1":
+    if os.environ.get("GPTME_SHOW_COST") in ("0", "false", "no", "off"):
         return None
+
+    quota = (msg.metadata.get("quota") if msg.metadata else None) or CostTracker.get_latest_quota()
+    quota_part = ""
+    if quota:
+        daily_limit = quota.get("daily_quota_tokens") or quota.get("daily_limit") or 0
+        daily_used = quota.get("daily_usage_tokens") or quota.get("daily_used") or 0
+        if daily_limit > 0:
+            pct = (daily_used / daily_limit * 100)
+            quota_part = f" | quota: {daily_used:,}/{daily_limit:,} ({pct:.1f}%)"
 
     # Prefer real per-message metadata (most accurate), but only when it
     # contains actual usage data — a metadata dict with only a "model" key
@@ -140,21 +165,38 @@ def inline_cost_text(msg: Message) -> str | None:
             total_in = input_tokens + cache_read + cache_creation
             cost_text = _format_cost(cost)
 
-            # Subscription providers: show "~$0 (subscription)" instead of $0.0000
+            is_sub = False
             if model_name:
                 try:
                     from ..llm.models import get_model
 
                     meta = get_model(model_name)
                     if meta and meta.pricing_type == "subscription":
+                        is_sub = True
                         cost_text = "~$0 (subscription)"
                 except Exception:
                     pass
 
-            return (
-                f"[cost: {cost_text} | tokens: {_fmt_tokens(total_in)} in / "
-                f"{_fmt_tokens(output_tokens)} out]"
-            )
+            if cost > 0:
+                return (
+                    f"[cost: {cost_text} | tokens: {_fmt_tokens(total_in)} in / "
+                    f"{_fmt_tokens(output_tokens)} out{quota_part}]"
+                )
+            elif is_sub and not quota:
+                return (
+                    f"[cost: {cost_text} | tokens: {_fmt_tokens(total_in)} in / "
+                    f"{_fmt_tokens(output_tokens)} out]"
+                )
+            elif "cost" in msg.metadata and not quota:
+                return (
+                    f"[cost: {cost_text} | tokens: {_fmt_tokens(total_in)} in / "
+                    f"{_fmt_tokens(output_tokens)} out]"
+                )
+            else:
+                return (
+                    f"[tokens: {_fmt_tokens(total_in)} in / "
+                    f"{_fmt_tokens(output_tokens)} out{quota_part}]"
+                )
 
     # Fall back to CostTracker last entry.
     session_costs = CostTracker.get_session_costs()
@@ -164,17 +206,25 @@ def inline_cost_text(msg: Message) -> str | None:
             last.input_tokens + last.cache_read_tokens + last.cache_creation_tokens
         )
         cost_text = _format_cost(last.cost)
+        is_sub = False
         try:
             from ..llm.models import get_model
 
             meta = get_model(last.model)
             if meta and meta.pricing_type == "subscription":
+                is_sub = True
                 cost_text = "~$0 (subscription)"
         except Exception:
             pass
+
+        if last.cost > 0 or is_sub:
+            return (
+                f"[cost: {cost_text} | tokens: {_fmt_tokens(total_in)} in / "
+                f"{_fmt_tokens(last.output_tokens)} out{quota_part}]"
+            )
         return (
-            f"[cost: {cost_text} | tokens: {_fmt_tokens(total_in)} in / "
-            f"{_fmt_tokens(last.output_tokens)} out]"
+            f"[tokens: {_fmt_tokens(total_in)} in / "
+            f"{_fmt_tokens(last.output_tokens)} out{quota_part}]"
         )
     return None
 
@@ -187,7 +237,9 @@ def print_inline_cost(msg: Message) -> None:
     if is_output_json() or is_output_quiet():
         return
     if text := inline_cost_text(msg):
-        console.print(f"[dim]{text}[/dim]")
+        from rich.markup import escape
+
+        console.print(f"[dim]{escape(text)}[/dim]")
 
 
 def gather_session_costs() -> CostData | None:
@@ -221,7 +273,13 @@ def gather_session_costs() -> CostData | None:
         request_count=costs.request_count,
     )
 
-    return CostData(last_request=last_request, total=total, source="session")
+    quota = CostTracker.get_latest_quota()
+    return CostData(
+        last_request=last_request,
+        total=total,
+        source="session",
+        quota=quota,
+    )
 
 
 def gather_conversation_costs(messages: list[Message]) -> CostData | None:
@@ -334,11 +392,21 @@ def gather_conversation_costs(messages: list[Message]) -> CostData | None:
     ):
         biggest_turn = None
 
+    # Look for most recent quota in messages
+    quota = None
+    for msg in reversed(messages):
+        if msg.metadata and "quota" in msg.metadata:
+            quota = msg.metadata["quota"]
+            break
+    if not quota:
+        quota = CostTracker.get_latest_quota()
+
     return CostData(
         last_request=last_request,
         total=total,
         source="conversation",
         biggest_turn=biggest_turn,
+        quota=quota,
     )
 
 
@@ -414,6 +482,28 @@ def display_costs(
             "[yellow]No cost data available. Use /tokens for approximation.[/yellow]"
         )
         return
+
+    # Show Quota section if available
+    quota = (
+        (session.quota if session and session.quota else None)
+        or (conversation.quota if conversation and conversation.quota else None)
+        or CostTracker.get_latest_quota()
+    )
+
+    if quota:
+        daily_limit = quota.get("daily_quota_tokens") or quota.get("daily_limit") or 0
+        daily_used = quota.get("daily_usage_tokens") or quota.get("daily_used") or 0
+        daily_remaining = quota.get("daily_remaining_tokens") or max(
+            0, daily_limit - daily_used
+        )
+        pct = (daily_used / daily_limit * 100) if daily_limit > 0 else 0
+
+        console.log("[bold]Daily Quota (URU AI Space):[/bold]")
+        console.log(f"  Limit:      {daily_limit:,} tokens")
+        console.log(f"  Used:       {daily_used:,} tokens ({pct:.2f}%)")
+        console.log(f"  Remaining:  {daily_remaining:,} tokens")
+        console.log(f"  Usage:      {_render_quota_bar(pct)}")
+        console.log("")
 
     # Show last request (prefer session, fall back to conversation)
     last_req = (session.last_request if session else None) or (

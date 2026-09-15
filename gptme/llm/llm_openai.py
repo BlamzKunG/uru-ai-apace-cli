@@ -226,6 +226,7 @@ def _record_usage(
     model: str,
     resolved_model: str | None = None,
     reasoning_effort: str | None = None,
+    quota: dict | None = None,
 ) -> MessageMetadata | None:
     """Record usage metrics as telemetry and return MessageMetadata.
 
@@ -233,13 +234,23 @@ def _record_usage(
     ``GPTME_THINKING_EFFORT``); it is stamped on the metadata so session logs
     record how much reasoning was requested, not just how many tokens came back.
     """
+    if quota:
+        try:
+            from ..util.cost_tracker import CostTracker
+
+            CostTracker.record_quota(quota)
+        except Exception:
+            pass
+
     if not usage:
-        if resolved_model or reasoning_effort:
+        if resolved_model or reasoning_effort or quota:
             bare: MessageMetadata = {"model": model}
             if resolved_model:
                 bare["resolved_model"] = resolved_model
             if reasoning_effort:
                 bare["reasoning_effort"] = reasoning_effort
+            if quota:
+                bare["quota"] = quota
             return bare
         return None
 
@@ -309,6 +320,8 @@ def _record_usage(
         metadata["reasoning_effort"] = reasoning_effort
     if usage_data:
         metadata["usage"] = usage_data
+    if quota:
+        metadata["quota"] = quota
     if cost > 0:
         metadata["cost"] = cost
     return metadata
@@ -1227,11 +1240,23 @@ def chat(
         else None
     )
     _resolved = _make_resolved_model(model, _or_provider) if _or_provider else None
+    _raw_quota = getattr(response, "model_quota", None)
+    if not _raw_quota and hasattr(response, "model_extra") and response.model_extra:
+        _raw_quota = response.model_extra.get("model_quota")
+    if _raw_quota:
+        if hasattr(_raw_quota, "model_dump"):
+            _raw_quota = _raw_quota.model_dump()
+        elif not isinstance(_raw_quota, dict):
+            try:
+                _raw_quota = dict(_raw_quota)
+            except Exception:
+                pass
     metadata = _record_usage(
         response.usage,
         model,
         resolved_model=_resolved,
         reasoning_effort=reasoning_effort,
+        quota=_raw_quota,
     )
     if not response.choices:
         raise ValueError("OpenAI API returned empty choices list")
@@ -1673,6 +1698,7 @@ def stream(
                 reasoning_effort=reasoning_effort,
             )
 
+    captured_quota: dict | None = None
     for chunk_raw in _stream_obj:
         from openai.types.chat import ChatCompletionChunk  # fmt: skip
         from openai.types.chat.chat_completion_chunk import (  # fmt: skip
@@ -1683,6 +1709,21 @@ def stream(
         # Cast the chunk to the correct type
         chunk = cast(ChatCompletionChunk, chunk_raw)
 
+        # Extract quota if present in chunk
+        _chunk_quota = getattr(chunk, "model_quota", None)
+        if not _chunk_quota and hasattr(chunk, "model_extra") and chunk.model_extra:
+            _chunk_quota = chunk.model_extra.get("model_quota")
+        if _chunk_quota:
+            if hasattr(_chunk_quota, "model_dump"):
+                captured_quota = _chunk_quota.model_dump()
+            elif isinstance(_chunk_quota, dict):
+                captured_quota = _chunk_quota
+            else:
+                try:
+                    captured_quota = dict(_chunk_quota)
+                except Exception:
+                    pass
+
         # Record usage if available (typically in final chunk)
         # and capture metadata for message attachment
         if hasattr(chunk, "usage") and chunk.usage:
@@ -1691,6 +1732,7 @@ def stream(
                 model,
                 resolved_model=_or_resolved,
                 reasoning_effort=reasoning_effort,
+                quota=captured_quota,
             )
 
         if not chunk.choices:
@@ -1742,10 +1784,20 @@ def stream(
 
     logger.debug(f"Stop reason: {stop_reason}")
 
-    if captured_metadata is None and reasoning_effort is not None:
-        # No usage chunk arrived; still record what was requested.
+    if captured_metadata is not None and captured_quota and "quota" not in captured_metadata:
+        captured_metadata["quota"] = captured_quota
+        try:
+            from ..util.cost_tracker import CostTracker
+
+            CostTracker.record_quota(captured_quota)
+        except Exception:
+            pass
+    elif captured_metadata is None and (
+        reasoning_effort is not None or captured_quota is not None
+    ):
+        # No usage chunk arrived; still record what was requested or quota.
         captured_metadata = _record_usage(
-            None, model, reasoning_effort=reasoning_effort
+            None, model, reasoning_effort=reasoning_effort, quota=captured_quota
         )
     # Return the captured metadata (accessible via StopIteration.value)
     return captured_metadata

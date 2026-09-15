@@ -94,6 +94,7 @@ class SessionCosts:
 
     session_id: str
     entries: list[CostEntry] = field(default_factory=list)
+    latest_quota: dict[str, Any] | None = None
     # Plugin-provided annotations keyed by plugin name.
     # Each key maps to a list of dicts recorded via record_extra().
     extras: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
@@ -310,9 +311,28 @@ class CostTracker:
             request_count=costs.request_count,
         )
 
+    _latest_quota: dict[str, Any] | None = None
+
+    @classmethod
+    def record_quota(cls, quota: dict[str, Any]) -> None:
+        """Store the latest quota status."""
+        cls._latest_quota = quota
+        session = cls._session_costs_var.get()
+        if session:
+            session.latest_quota = quota
+
+    @classmethod
+    def get_latest_quota(cls) -> dict[str, Any] | None:
+        """Get latest quota information."""
+        session = cls._session_costs_var.get()
+        if session and session.latest_quota:
+            return session.latest_quota
+        return cls._latest_quota
+
     @classmethod
     def reset(cls) -> None:
         """Reset cost tracking (for testing)."""
         with cls._sessions_lock:
             cls._sessions.clear()
         cls._session_costs_var.set(None)
+        cls._latest_quota = None
