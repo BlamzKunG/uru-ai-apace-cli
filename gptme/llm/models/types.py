@@ -115,6 +115,7 @@ PROVIDERS_OPENAI = [
     "moonshot",
     "nvidia",
     "local",
+    "uru",
 ]
 
 
