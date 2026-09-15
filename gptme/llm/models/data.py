@@ -89,6 +89,7 @@ OPENAI_COMPAT_PROVIDERS: frozenset[str] = frozenset(
         # via the OpenAI-compatible API (see llm_openai.py) — same fallback applies
         # when dynamic fetch fails/misses and no static registry entry exists.
         "gptme",
+        "uru",
     }
 )
 
@@ -821,6 +822,14 @@ _MODELS_RAW: dict[Provider, dict[str, _ModelDictMeta]] = {
         "static": {
             "context": 128_000,
             "max_output": 4096,
+            "price_input": 0,
+            "price_output": 0,
+        },
+    },
+    "uru": {
+        "gemini-3.5-flash": {
+            "context": 128_000,
+            "max_output": 8192,
             "price_input": 0,
             "price_output": 0,
         },

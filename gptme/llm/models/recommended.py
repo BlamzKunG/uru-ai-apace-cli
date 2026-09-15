@@ -40,6 +40,7 @@ RECOMMENDED_MODELS: dict[str, str] = {
     "gptme": "claude-sonnet-4-6",
     "deepseek": "deepseek-v4-flash",
     "groq": "llama-3.3-70b-versatile",
+    "uru": "gemini-3.5-flash",
 }
 
 # Cheaper/faster model per provider used for summaries, titles, and other
@@ -51,6 +52,7 @@ SUMMARY_MODELS: dict[str, str] = {
     "gemini": "gemini-2.5-flash",
     "deepseek": "deepseek-v4-flash",
     "xai": "grok-4-1-fast",
+    "uru": "gemini-3.5-flash",
 }
 
 RecommendedFormat = Literal["table", "rst", "markdown", "json"]

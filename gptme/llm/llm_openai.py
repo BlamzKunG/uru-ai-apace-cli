@@ -646,6 +646,14 @@ def init(provider: Provider, config: Config):
             base_url="https://integrate.api.nvidia.com/v1",
             timeout=timeout,
         )
+    elif provider == "uru":
+        api_key = config.get_env("URU_API_KEY") or config.get_env("OPENAI_API_KEY")
+        if not api_key:
+            raise KeyError("Missing environment variable URU_API_KEY (or OPENAI_API_KEY)")
+        base_url = config.get_env("URU_BASE_URL", "https://gen.ai.kku.ac.th/uruacth/api/v1")
+        _init_openai_client(
+            provider, api_key=api_key, base_url=base_url, timeout=timeout
+        )
     elif provider == "local":
         # OPENAI_API_BASE renamed to OPENAI_BASE_URL: https://github.com/openai/openai-python/issues/745
         api_base = config.get_env("OPENAI_API_BASE")
