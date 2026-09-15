@@ -96,49 +96,96 @@ def _replacement_prompt(
 
 @command("model", completer=_complete_model)
 def cmd_model(ctx: CommandContext) -> "Generator[Message, None, None]":
-    """Show or switch the current model."""
+    """Show or switch the current model with interactive menu."""
+    import sys
     from ..config import ChatConfig  # fmt: skip
     from ..llm.models import (  # fmt: skip
         get_default_model,
         set_default_model,
+        get_model,
     )
+    from ..llm.models.listing import _get_models_for_provider  # fmt: skip
     from ..tools.base import get_tool_format, set_tool_format  # fmt: skip
+
+    current_model = get_default_model()
 
     if ctx.args:
         new_model = ctx.args[0]
-        set_default_model(new_model)
-        model_meta = get_default_model()
-        assert model_meta is not None
-        new_tool_format = model_meta.default_tool_format or get_tool_format()
-
-        # Persist all dependent runtime state before appending a replacement
-        # generated prompt. Historical prompts remain in the append-only log;
-        # prepare_messages() only sends the newest generation to providers.
-        chat_config = ChatConfig.from_logdir(ctx.manager.logdir)
-        chat_config.model = new_model
-        chat_config.tool_format = new_tool_format
-        chat_config.save()
-        set_tool_format(new_tool_format)
-        yield from _replacement_prompt(
-            chat_config,
-            model=model_meta.full,
-            tool_format=new_tool_format,
-        )
-        print(f"Set model to {new_model}")
-        print(f"Switched tool format to '{new_tool_format}'")
     else:
-        model = get_default_model()
-        if not model:
-            print("No model configured. Use `/model <model>` to set one.")
+        # Show current model info
+        if current_model:
+            print(f"Current model: {current_model.full} ({current_model.context:,} tokens context)")
+        else:
+            print("No model currently configured.")
+
+        # Interactive selection if running in interactive terminal
+        if not sys.stdin.isatty():
             return
-        print(f"Current model: {model.full}")
-        print(
-            f"  price: input ${model.price_input}/Mtok, output ${model.price_output}/Mtok"
-        )
-        print(f"  context: {model.context}, max output: {model.max_output}")
-        print(
-            f"  (streaming: {model.supports_streaming}, vision: {model.supports_vision})"
-        )
+
+        try:
+            import questionary
+            from questionary import Choice
+        except ImportError:
+            print("Use `/model <model>` to change model.")
+            return
+
+        # Fetch models dynamically (prefer uru provider)
+        try:
+            models = _get_models_for_provider("uru", dynamic_fetch=True)
+        except Exception:
+            from ..llm.models.data import MODELS  # fmt: skip
+            models = [get_model(f"uru/{m}") for m in MODELS.get("uru", {})]
+
+        if not models:
+            print("No models available.")
+            return
+
+        choices = []
+        default_val = None
+        for m in models:
+            full_name = f"uru/{m.model}" if not m.model.startswith("uru/") else m.model
+            is_current = current_model and (current_model.full == full_name or current_model.model == m.model)
+            ctx_text = f"({m.context:,} tokens)" if m.context else ""
+            title = f"{m.model:<26} {ctx_text}"
+            if is_current:
+                title += " ★ (current)"
+                default_val = full_name
+            choices.append(Choice(title=title, value=full_name))
+
+        try:
+            selected = questionary.select(
+                "Select model (↑/↓ to move, Enter to choose, Ctrl+C to cancel):",
+                choices=choices,
+                default=default_val,
+            ).ask()
+        except KeyboardInterrupt:
+            selected = None
+
+        if not selected:
+            print("Model change cancelled.")
+            return
+
+        new_model = selected
+
+    set_default_model(new_model)
+    model_meta = get_default_model()
+    assert model_meta is not None
+    new_tool_format = model_meta.default_tool_format or get_tool_format()
+
+    # Persist all dependent runtime state before appending a replacement
+    # generated prompt. Historical prompts remain in the append-only log;
+    # prepare_messages() only sends the newest generation to providers.
+    chat_config = ChatConfig.from_logdir(ctx.manager.logdir)
+    chat_config.model = new_model
+    chat_config.tool_format = new_tool_format
+    chat_config.save()
+    set_tool_format(new_tool_format)
+    yield from _replacement_prompt(
+        chat_config,
+        model=model_meta.full,
+        tool_format=new_tool_format,
+    )
+    print(f"✅ Switched model to {new_model}")
 
 
 @command("models")
