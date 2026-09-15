@@ -827,7 +827,172 @@ _MODELS_RAW: dict[Provider, dict[str, _ModelDictMeta]] = {
         },
     },
     "uru": {
+        # Claude
+        "claude-sonnet-5": {
+            "context": 200_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "claude-sonnet-4.6": {
+            "context": 200_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        # Deepseek
+        "deepseek-v4-pro": {
+            "context": 128_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "deepseek-v4-flash": {
+            "context": 128_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        # Gemini
+        "gemini-3.8-flash": {
+            "context": 1_000_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "gemini-3.7-flash": {
+            "context": 1_000_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "gemini-3.6-flash": {
+            "context": 1_000_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
         "gemini-3.5-flash": {
+            "context": 1_000_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "gemini-3.1-pro-preview": {
+            "context": 1_000_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "gemini-3.1-flash-lite": {
+            "context": 1_000_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "gemini-3.1-flash-lite-preview": {
+            "context": 1_000_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "gemini-2.5-flash-lite": {
+            "context": 1_000_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        # Meta AI
+        "llama-4-maverick": {
+            "context": 128_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "llama-4-scout": {
+            "context": 128_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        # Mistral
+        "mistral-medium-3": {
+            "context": 128_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        # Nova (AWS)
+        "nova-2-lite-v1": {
+            "context": 128_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        # OpenAI
+        "gpt-5.6-terra-pro": {
+            "context": 200_000,
+            "max_output": 16384,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "gpt-5.6-luna-pro": {
+            "context": 200_000,
+            "max_output": 16384,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "gpt-5.4": {
+            "context": 128_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "gpt-5.4-mini": {
+            "context": 128_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "gpt-5.4-nano": {
+            "context": 128_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        # Qwen
+        "qwen3.7-plus": {
+            "context": 128_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "qwen3.7-max": {
+            "context": 128_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "qwen3.5-9b": {
+            "context": 128_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "qwen3.6-flash": {
+            "context": 128_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        # xAI
+        "grok-4.5": {
+            "context": 128_000,
+            "max_output": 8192,
+            "price_input": 0,
+            "price_output": 0,
+        },
+        "grok-4.3": {
             "context": 128_000,
             "max_output": 8192,
             "price_input": 0,

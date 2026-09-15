@@ -40,7 +40,7 @@ RECOMMENDED_MODELS: dict[str, str] = {
     "gptme": "claude-sonnet-4-6",
     "deepseek": "deepseek-v4-flash",
     "groq": "llama-3.3-70b-versatile",
-    "uru": "gemini-3.5-flash",
+    "uru": "gemini-3.8-flash",
 }
 
 # Cheaper/faster model per provider used for summaries, titles, and other
